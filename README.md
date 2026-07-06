@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.3.0" src="https://img.shields.io/badge/version-0.3.0-2f81f7">
+  <img alt="Version 0.3.3" src="https://img.shields.io/badge/version-0.3.3-2f81f7">
   <a href="LICENSE"><img alt="GNU GPL v3.0" src="https://img.shields.io/badge/license-GPLv3-3da639"></a>
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-b7410e">
@@ -78,9 +78,17 @@ logs by default. Configuration stays in one user-only local TOML file. See
 - **Keep running** (the opposite direction): relaunch selected apps
   automatically when they quit, e.g. after a crash or an update. Apps on
   this list are never auto-quit — the two checkboxes are mutually
-  exclusive in the app list. An optional restart-loop protection stops
-  relaunching an app until the next day after two automatic restarts within
-  an hour — so a crash-looping app, or one you quit on purpose, stays down.
+  exclusive in the app list. Kept apps are also launched when RustQuit
+  starts and right when you check the box. Relaunches happen **hidden and
+  without stealing focus**: menu bar icons come back, but no settings or
+  main window ever pops up; a regular app waits in the Dock, one click
+  away. Menu bar apps come back after any termination; a regular
+  (Dock) app is only resurrected when it actually **crashed** — RustQuit
+  reads the exit status from the kernel, so quitting an app deliberately
+  (closing the settings window of a menu bar suite, ⌘Q, an updater) is
+  always respected. An optional restart-loop protection additionally stops
+  relaunching an app until the next day after two automatic restarts
+  within an hour; re-checking the Keep box lifts that pause immediately.
 - **Recently Quit menu**: the last few auto-quit apps, one click to reopen
 - **Launch at login** via SMAppService, toggled in Settings
 - **Menu bar status**: shows plainly when the Accessibility permission is
@@ -171,6 +179,12 @@ On first launch, macOS asks for the **Accessibility permission**
 (System Settings → Privacy & Security → Accessibility). RustQuit needs it to
 observe window events; that is the entire reason it exists. Until granted,
 the engine idles and the menu bar item shows what to do.
+
+If you use the keep-running feature, macOS additionally asks for the
+**App Management permission** the first time RustQuit launches another app.
+Because kept apps are started at RustQuit startup and right when you check
+their box, that prompt appears while you are setting things up — not at the
+first crash.
 
 ### Why the signing script matters
 
@@ -280,11 +294,11 @@ confirms it actually terminated.
   like apps hidden with ⌘H from the outside, so this special handling is
   limited to a short built-in list (currently Discord). For a listed app,
   hiding it with ⌘H counts as closing it.
-- Keep running cannot tell a crash from a deliberate ⌘Q — macOS does not
-  reveal why an app terminated. An app you quit by hand therefore comes
-  back after the restart delay; quit it twice more and the loop protection
-  keeps it down for the day, or flip the "Keep Running" toggle in the menu
-  bar first.
+- Quitting a kept **menu bar app** by hand brings it back after the
+  restart delay — for an app without windows, RustQuit cannot tell that
+  quit from a crash worth undoing. Uncheck its Keep box (or flip the
+  "Keep Running" toggle) first. Regular Dock apps are not affected: their
+  deliberate quits are recognized via the exit status and respected.
 - The settings window lists apps from `/Applications`,
   `/System/Applications` and `~/Applications`, including nested app folders
   up to two levels deep. Anything else can be added via "Add App…".

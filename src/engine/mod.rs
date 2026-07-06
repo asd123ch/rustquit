@@ -47,7 +47,7 @@ const RECOUNT_QUEUE_CAPACITY: usize = 256;
 /// closed the last window" instead of "the user hid the app".
 const CLOSE_TO_BACKGROUND_BUNDLE_IDS: &[&str] = &["com.hnc.discord"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RecountPhase {
     WindowDestroyed,
     AppDeactivated,
@@ -63,10 +63,12 @@ struct RecountRequest {
 struct RecountResult {
     request: RecountRequest,
     count: ax::AxResult<counter::WindowCount>,
-    /// Window-server cross-check, computed on the worker (the systemwide
-    /// CGWindowList enumeration must not run on the main thread). Only
-    /// present for a final check whose AX count came back zero.
-    cg_count: Option<Option<usize>>,
+    /// Visible normal windows per the window server, computed on the
+    /// worker (the systemwide CGWindowList enumeration must not run on
+    /// the main thread). `None` if the window list was unavailable.
+    /// Vetoes the quit on a final check and feeds the "windowless before
+    /// termination" signal for keep-alive.
+    cg_count: Option<usize>,
 }
 
 struct PendingTermination {
@@ -157,9 +159,7 @@ impl Engine {
             .spawn(move || {
                 while let Ok(request) = worker_rx.recv() {
                     let count = counter::effective_window_count(request.pid);
-                    let cg_count = (matches!(request.phase, RecountPhase::FinalCheck)
-                        && count.as_ref().is_ok_and(|c| c.effective == 0))
-                    .then(|| counter::cg_window_count(request.pid));
+                    let cg_count = counter::cg_window_count(request.pid);
                     if worker_tx
                         .send(RecountResult {
                             request,
@@ -445,9 +445,21 @@ impl Engine {
         if watcher.generation.get() != request.generation {
             return;
         }
-        let Ok(count) = count else {
-            return;
+        let count = match count {
+            Ok(count) => count,
+            Err(err) => {
+                tracing::debug!(pid = request.pid, ?err, "recount failed");
+                return;
+            }
         };
+        tracing::debug!(
+            pid = request.pid,
+            phase = ?request.phase,
+            effective = count.effective,
+            ordered_out = count.ordered_out,
+            ?cg_count,
+            "recount result"
+        );
         // Remembered for the hidden-app guard: a close-to-background app
         // whose last recount saw an ordered-out standard window closed that
         // window; it did not get hidden by the user.
@@ -466,13 +478,6 @@ impl Engine {
             }
             RecountPhase::FinalCheck => {
                 drop(watchers);
-                // The worker computes the CG cross-check for every final
-                // check whose AX count is zero; a missing value means the
-                // pipeline changed and quitting would be unverified.
-                let Some(cg_count) = cg_count else {
-                    tracing::debug!(pid = request.pid, "quit cancelled: CG count missing");
-                    return;
-                };
                 self.finish_quit_after_recount(request.pid, request.generation, cg_count);
             }
         }
