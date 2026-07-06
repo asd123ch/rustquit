@@ -85,6 +85,9 @@ pub struct SettingsIvars {
     /// Menu bar target, informed after toggles so the icon and the menu
     /// checkmarks stay in sync with the settings window.
     tray: RefCell<Option<objc2::rc::Weak<crate::tray::TrayTarget>>>,
+    /// Checking a Keep box launches the app right away when it is not
+    /// running (and triggers the App Management prompt up front).
+    keep_alive: RefCell<Option<std::rc::Rc<crate::keepalive::KeepAlive>>>,
 }
 
 define_class!(
@@ -176,6 +179,14 @@ define_class!(
                 });
                 tracing::error!(%err, "cannot persist keep-alive list");
                 return;
+            }
+            if listed {
+                // A kept app should be running; launching it now also
+                // raises the App Management prompt at configuration time
+                // and lifts a loop-protection pause.
+                if let Some(keep_alive) = self.ivars().keep_alive.borrow().as_ref() {
+                    keep_alive.keep_checked(&bundle_id);
+                }
             }
             self.refresh_after_toggle();
         }
@@ -331,8 +342,13 @@ impl SettingsController {
             restart_delay_popup: RefCell::new(None),
             loop_protection_checkbox: RefCell::new(None),
             tray: RefCell::new(None),
+            keep_alive: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
+    }
+
+    pub fn set_keep_alive(&self, keep_alive: std::rc::Rc<crate::keepalive::KeepAlive>) {
+        self.ivars().keep_alive.replace(Some(keep_alive));
     }
 
     /// Wires the menu bar target so toggles made here update the menu

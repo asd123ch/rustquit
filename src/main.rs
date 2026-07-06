@@ -6,6 +6,7 @@ mod engine;
 mod instance;
 mod keepalive;
 mod permissions;
+mod procexit;
 mod protected;
 mod settings_window;
 mod tray;
@@ -49,7 +50,8 @@ fn main() {
 
     // Relaunches keep-alive apps; independent of the engine and its
     // Accessibility permission. Must stay alive until run() ends.
-    let _keep_alive = keepalive::setup(config.clone(), recent_quits.clone());
+    let keep_alive = keepalive::setup(config.clone(), recent_quits.clone());
+    settings.set_keep_alive(keep_alive.handle());
 
     // Debug helper: open the settings window right away.
     if std::env::var_os("RUSTQUIT_SHOW_SETTINGS").is_some() {
