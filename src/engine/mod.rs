@@ -338,6 +338,16 @@ impl Engine {
 
     /// Decides from the config whether the app may be auto-quit.
     fn should_quit(&self, watcher: &Watcher) -> bool {
+        // Re-check the activation policy at decision time, not just when the
+        // watcher was created. Menu bar apps that flip to Regular only while
+        // a window is open (many Tauri/Electron apps do this to get a proper
+        // Dock presence and window focus) switch back to Accessory as the
+        // window closes. Quitting them would kill an app the user expects to
+        // keep living in the menu bar, so never quit an app that is not a
+        // regular Dock app right now.
+        if watcher.app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            return false;
+        }
         // Defense in depth: never touch anything under /System/Library/.
         let path = watcher
             .app

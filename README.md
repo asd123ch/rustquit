@@ -10,8 +10,8 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.3.3" src="https://img.shields.io/badge/version-0.3.3-2f81f7">
-  <a href="LICENSE"><img alt="GNU GPL v3.0" src="https://img.shields.io/badge/license-GPLv3-3da639"></a>
+  <img alt="Version 0.3.4" src="https://img.shields.io/badge/version-0.3.4-2f81f7">
+  <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-b7410e">
   <a href="#privacy"><img alt="Privacy: no telemetry" src="https://img.shields.io/badge/privacy-no_telemetry-6f42c1"></a>
@@ -133,7 +133,7 @@ recurring problems from its issue tracker:
 |---|---|
 | Silent crashes ([#18](https://github.com/onebadidea/swiftquit/issues/18), [#51](https://github.com/onebadidea/swiftquit/issues/51)) | Fresh recount engine, `Result`-based AX layer, callback panic boundaries |
 | Firefox / iTerm2 / Discord never quit ([#26](https://github.com/onebadidea/swiftquit/issues/26), [#27](https://github.com/onebadidea/swiftquit/issues/27), [#25](https://github.com/onebadidea/swiftquit/issues/25)) | Rescue recount on app deactivation (AppKit events, independent of the app's AX quality) + `AXManualAccessibility` nudge for Electron + hidden-window detection for Discord's close-to-background behavior |
-| Quit requests sent to background menu-bar apps ([#58](https://github.com/onebadidea/swiftquit/issues/58)) | Only apps with a Dock presence (regular activation policy) are ever watched |
+| Quit requests sent to background menu-bar apps ([#58](https://github.com/onebadidea/swiftquit/issues/58)) | Only Dock apps are watched, and the activation policy is re-checked at quit time so apps that switch to menu bar mode as their window closes (many Tauri/Electron apps) are never quit |
 | Closing a tab quit the app ([#6](https://github.com/onebadidea/swiftquit/issues/6)) | Only `AXStandardWindow` subroles count; delay + fresh re-check before quitting |
 | Hidden/minimized/other-Space windows miscounted ([#7](https://github.com/onebadidea/swiftquit/issues/7)) | Fresh AX count each time, CGWindowList cross-check, hidden apps (⌘H) never quit |
 | Fixed 2 s delay ([#34](https://github.com/onebadidea/swiftquit/issues/34), [#50](https://github.com/onebadidea/swiftquit/issues/50)) | Delay configurable from 0.05 to 10 s |
@@ -274,8 +274,9 @@ instead of closing it) are recognized and ignored.
 
 Once the count reaches zero, RustQuit waits for the configured delay and
 then re-checks everything: the app must still be running, still windowless,
-not hidden with ⌘H, and still allowed by the current settings, and the
-window server must agree that no visible window remains — including
+not hidden with ⌘H, still a regular Dock app (an app that has switched to
+menu bar mode is left alone), and still allowed by the current settings, and
+the window server must agree that no visible window remains — including
 full-screen windows on other Spaces. Only then is the app asked to quit,
 with the same polite request as pressing ⌘Q: save dialogs still appear and
 are never bypassed. The app lands in the "Recently Quit" menu once macOS
@@ -347,5 +348,5 @@ RustQuit stands on the work of open-source projects:
 Copyright (c) 2026 asd123.ai.
 
 RustQuit is free software licensed under the
-[GNU General Public License, version 3](LICENSE). You may use, study, modify
-and redistribute it under those terms.
+[GNU Affero General Public License, version 3](LICENSE). You may use, study,
+modify and redistribute it under those terms.
