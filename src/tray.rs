@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
@@ -14,12 +16,14 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSString, ns_string};
 
 use crate::config::ConfigHandle;
 use crate::engine::recent::{RecentQuitsHandle, age_label};
+use crate::keepalive::KeepAlive;
 use crate::settings_window::SettingsController;
 
 pub struct TrayIvars {
     config: ConfigHandle,
     settings: Retained<SettingsController>,
     recent_quits: RecentQuitsHandle,
+    keep_alive: Rc<KeepAlive>,
     enabled_item: RefCell<Option<Retained<NSMenuItem>>>,
     keep_alive_item: RefCell<Option<Retained<NSMenuItem>>>,
     status_button: RefCell<Option<Retained<NSStatusBarButton>>>,
@@ -112,6 +116,26 @@ define_class!(
             }
         }
 
+        #[unsafe(method(onIgnoreKeepFor24Hours:))]
+        fn on_ignore_keep_for_24_hours(&self, sender: Option<&NSMenuItem>) {
+            let Some(bundle_id) = represented_bundle_id(sender) else {
+                return;
+            };
+            if let Err(err) = self.ivars().keep_alive.ignore_for_24_hours(&bundle_id) {
+                tracing::error!(%err, "cannot persist keep-alive ignore");
+            }
+        }
+
+        #[unsafe(method(onResumeKeepNow:))]
+        fn on_resume_keep_now(&self, sender: Option<&NSMenuItem>) {
+            let Some(bundle_id) = represented_bundle_id(sender) else {
+                return;
+            };
+            if let Err(err) = self.ivars().keep_alive.resume_now(&bundle_id) {
+                tracing::error!(%err, "cannot resume keep-alive app");
+            }
+        }
+
         #[unsafe(method(onQuit:))]
         fn on_quit(&self, _sender: Option<&AnyObject>) {
             let mtm = MainThreadMarker::from(self);
@@ -126,11 +150,13 @@ impl TrayTarget {
         config: ConfigHandle,
         settings: Retained<SettingsController>,
         recent_quits: RecentQuitsHandle,
+        keep_alive: Rc<KeepAlive>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TrayIvars {
             config,
             settings,
             recent_quits,
+            keep_alive,
             enabled_item: RefCell::new(None),
             keep_alive_item: RefCell::new(None),
             status_button: RefCell::new(None),
@@ -213,19 +239,48 @@ impl TrayTarget {
         let target_obj: &AnyObject = self;
         for entry in entries {
             let title = format!("{} — {}", entry.name, age_label(entry.when));
-            let item = unsafe {
-                NSMenuItem::initWithTitle_action_keyEquivalent(
-                    NSMenuItem::alloc(mtm),
-                    &NSString::from_str(&title),
-                    Some(sel!(onReopenApp:)),
-                    ns_string!(""),
-                )
-            };
-            unsafe {
-                item.setTarget(Some(target_obj));
-                item.setRepresentedObject(Some(&NSString::from_str(&entry.bundle_id)));
+            let open = recent_action_item(
+                &title,
+                sel!(onReopenApp:),
+                &entry.bundle_id,
+                target_obj,
+                mtm,
+            );
+            menu.addItem(&open);
+
+            let kept = ivars
+                .config
+                .data
+                .borrow()
+                .keep_alive_apps
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&entry.bundle_id));
+            if kept {
+                let (label, action) = match ivars.keep_alive.ignore_remaining(&entry.bundle_id) {
+                    Some(remaining) => (
+                        format!("Resume Keep Now ({} remaining)", duration_label(remaining)),
+                        sel!(onResumeKeepNow:),
+                    ),
+                    None => (
+                        "Ignore Keep for 24 Hours".to_string(),
+                        sel!(onIgnoreKeepFor24Hours:),
+                    ),
+                };
+                let ignore = recent_action_item(&label, action, &entry.bundle_id, target_obj, mtm);
+                let actions = NSMenu::new(mtm);
+                actions.addItem(&ignore);
+
+                let options = unsafe {
+                    NSMenuItem::initWithTitle_action_keyEquivalent(
+                        NSMenuItem::alloc(mtm),
+                        &NSString::from_str(&format!("Keep Options — {}", entry.name)),
+                        None,
+                        ns_string!(""),
+                    )
+                };
+                options.setSubmenu(Some(&actions));
+                menu.addItem(&options);
             }
-            menu.addItem(&item);
         }
     }
 }
@@ -242,8 +297,9 @@ impl Tray {
         config: ConfigHandle,
         settings: Retained<SettingsController>,
         recent_quits: RecentQuitsHandle,
+        keep_alive: Rc<KeepAlive>,
     ) -> Tray {
-        let target = TrayTarget::new(mtm, config, settings, recent_quits);
+        let target = TrayTarget::new(mtm, config, settings, recent_quits, keep_alive);
 
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -393,5 +449,41 @@ impl Tray {
 
     pub fn target_retained(&self) -> Retained<TrayTarget> {
         self.target.clone()
+    }
+}
+
+fn represented_bundle_id(sender: Option<&NSMenuItem>) -> Option<String> {
+    let object = sender?.representedObject()?;
+    object.downcast::<NSString>().ok().map(|id| id.to_string())
+}
+
+fn recent_action_item(
+    title: &str,
+    action: objc2::runtime::Sel,
+    bundle_id: &str,
+    target: &AnyObject,
+    mtm: MainThreadMarker,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            ns_string!(""),
+        )
+    };
+    unsafe {
+        item.setTarget(Some(target));
+        item.setRepresentedObject(Some(&NSString::from_str(bundle_id)));
+    }
+    item
+}
+
+fn duration_label(remaining: Duration) -> String {
+    let minutes = remaining.as_secs().div_ceil(60);
+    if minutes >= 60 {
+        format!("{}h", minutes.div_ceil(60))
+    } else {
+        format!("{minutes}m")
     }
 }

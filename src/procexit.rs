@@ -5,8 +5,8 @@
 //! process's wait status on exit (`NOTE_EXITSTATUS`). A status that ends
 //! in a signal (SIGSEGV, SIGKILL, …) means the app crashed or was killed;
 //! a plain `exit()` means the app chose to quit. Keep-alive uses this to
-//! relaunch regular apps only after crashes while respecting deliberate
-//! quits (closing the settings window of a menu bar suite, ⌘Q, updaters).
+//! respect deliberate quits when automatic launching of missing kept apps
+//! is disabled.
 //!
 //! One background thread blocks in `kevent` forever — no polling, no idle
 //! wake-ups. Registrations happen from the main thread on the same kqueue,

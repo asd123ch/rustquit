@@ -297,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "rustquit"
-version = "0.3.4"
+version = "0.3.8"
 dependencies = [
  "block2",
  "dirs",

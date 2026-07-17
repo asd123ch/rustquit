@@ -1,6 +1,6 @@
 [package]
 name = "rustquit"
-version = "0.3.4"
+version = "0.3.8"
 edition = "2024"
 rust-version = "1.85"
 description = "Privacy-focused macOS menu bar utility that quits apps after their last window closes"

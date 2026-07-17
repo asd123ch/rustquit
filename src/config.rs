@@ -2,6 +2,7 @@
 //! A corrupt or missing file never crashes the app — it just yields defaults.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -39,6 +40,10 @@ pub struct Config {
     pub apps: Vec<String>,
     /// Master toggle for relaunching the keep-alive apps.
     pub keep_alive_enabled: bool,
+    /// Relaunch kept apps after any termination and restore missing ones
+    /// when RustQuit starts.
+    #[serde(alias = "keep_alive_launch_at_startup")]
+    pub keep_alive_auto_start_missing: bool,
     /// Wait after a keep-alive app terminates before relaunching it, so
     /// self-relaunching updaters win the race.
     pub keep_alive_delay_secs: f64,
@@ -48,6 +53,9 @@ pub struct Config {
     /// Bundle IDs to keep running. Listed apps are never auto-quit, even
     /// while the keep-alive master toggle is off.
     pub keep_alive_apps: Vec<String>,
+    /// Lowercase bundle ID -> Unix timestamp through which automatic Keep
+    /// launches are suppressed. Entries are created from the tray menu.
+    pub keep_alive_ignored_until: BTreeMap<String, u64>,
 }
 
 impl Default for Config {
@@ -60,9 +68,11 @@ impl Default for Config {
             enabled: true,
             apps: Vec::new(),
             keep_alive_enabled: true,
+            keep_alive_auto_start_missing: true,
             keep_alive_delay_secs: 10.0,
             keep_alive_loop_protection: true,
             keep_alive_apps: Vec::new(),
+            keep_alive_ignored_until: BTreeMap::new(),
         }
     }
 }
@@ -144,6 +154,23 @@ impl ConfigStore {
     /// Adds a bundle ID to the keep-alive list or removes it, then saves.
     pub fn set_keep_alive_listed(&self, bundle_id: &str, listed: bool) -> io::Result<()> {
         self.update(|config| set_listed(&mut config.keep_alive_apps, bundle_id, listed))
+    }
+
+    /// Sets or clears a persistent Keep suppression deadline.
+    pub fn set_keep_alive_ignored_until(
+        &self,
+        bundle_id: &str,
+        until: Option<u64>,
+    ) -> io::Result<()> {
+        let key = bundle_id.to_ascii_lowercase();
+        self.update(|config| match until {
+            Some(until) => {
+                config.keep_alive_ignored_until.insert(key, until);
+            }
+            None => {
+                config.keep_alive_ignored_until.remove(&key);
+            }
+        })
     }
 
     fn save_current(&self) -> io::Result<()> {
@@ -228,6 +255,7 @@ fn normalize(config: &mut Config) {
 
     normalize_app_list(&mut config.apps);
     normalize_app_list(&mut config.keep_alive_apps);
+    normalize_ignored_apps(&mut config.keep_alive_ignored_until);
 
     // An app cannot be on both lists; keep-alive wins (matches the engine,
     // which never auto-quits a keep-alive app). The settings window greys
@@ -238,6 +266,29 @@ fn normalize(config: &mut Config) {
             .iter()
             .any(|keep| keep.eq_ignore_ascii_case(bundle_id))
     });
+}
+
+fn normalize_ignored_apps(ignored: &mut BTreeMap<String, u64>) {
+    let now = unix_timestamp();
+    let previous = std::mem::take(ignored);
+    for (bundle_id, until) in previous {
+        if ignored.len() >= MAX_APPS {
+            break;
+        }
+        if until > now && valid_bundle_id(&bundle_id) {
+            ignored
+                .entry(bundle_id.to_ascii_lowercase())
+                .and_modify(|stored| *stored = (*stored).max(until))
+                .or_insert(until);
+        }
+    }
+}
+
+pub fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn normalize_app_list(list: &mut Vec<String>) {
