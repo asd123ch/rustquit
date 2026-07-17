@@ -98,7 +98,7 @@ fn onscreen_window_ids(pid: libc::pid_t) -> Option<HashSet<u32>> {
         let dict = unsafe { ptr.cast::<CFDictionary>().as_ref() };
         if dict_i64(dict, unsafe { kCGWindowOwnerPID }) == Some(pid as i64)
             && dict_i64(dict, unsafe { kCGWindowLayer }) == Some(0)
-            && dict_bool(dict, unsafe { kCGWindowIsOnscreen })
+            && dict_bool(dict, unsafe { kCGWindowIsOnscreen }).is_some_and(|value| value)
             && dict_f64(dict, unsafe { kCGWindowAlpha }).is_some_and(|a| a > 0.0)
         {
             if let Some(number) = dict_i64(dict, unsafe { kCGWindowNumber }) {
@@ -111,17 +111,14 @@ fn onscreen_window_ids(pid: libc::pid_t) -> Option<HashSet<u32>> {
     Some(ids)
 }
 
-/// Number of visible normal windows of the pid according to the window
-/// server: layer == 0, onscreen, alpha > 0.
+/// Number of plausible normal windows of the pid according to the window
+/// server: layer == 0, alpha > 0, and either onscreen or assigned only to an
+/// inactive Space.
 ///
-/// The onscreen requirement is load-bearing, not an optimization. Apps keep
-/// permanent phantom layer-0 windows with alpha 1 (per-display tab bars,
-/// hidden panels; TextEdit alone owns ~18 of them even with no real window
-/// open). Counting off-screen windows would therefore veto every quit and
-/// disable the app. Dropping them is still safe: minimized windows are
-/// covered by the AX count (they stay in AXWindows), and a full-screen
-/// window on another, inactive Space reports onscreen == true (verified
-/// empirically) and keeps vetoing correctly.
+/// Apps keep permanent phantom layer-0 windows, so not every offscreen window
+/// can veto a quit. SkyLight separates those still attached to a currently
+/// visible Space (ordered out / phantom) from real windows parked on another
+/// Desktop. Query failures count conservatively and keep the app alive.
 pub fn cg_window_count(pid: libc::pid_t) -> Option<usize> {
     let option = CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements;
     let list = CGWindowListCopyWindowInfo(option, kCGNullWindowID)?;
@@ -132,26 +129,37 @@ pub fn cg_window_count(pid: libc::pid_t) -> Option<usize> {
             continue;
         };
         let dict = unsafe { ptr.cast::<CFDictionary>().as_ref() };
-        if dict_i64(dict, unsafe { kCGWindowOwnerPID }) == Some(pid as i64)
-            && dict_i64(dict, unsafe { kCGWindowLayer }) == Some(0)
-            && dict_bool(dict, unsafe { kCGWindowIsOnscreen })
-            && dict_f64(dict, unsafe { kCGWindowAlpha }).is_some_and(|a| a > 0.0)
+        if dict_i64(dict, unsafe { kCGWindowOwnerPID }) != Some(pid as i64)
+            || dict_i64(dict, unsafe { kCGWindowLayer }) != Some(0)
+            || !dict_f64(dict, unsafe { kCGWindowAlpha }).is_some_and(|a| a > 0.0)
         {
+            continue;
+        }
+        let onscreen = dict_bool(dict, unsafe { kCGWindowIsOnscreen });
+        let on_current_space = dict_i64(dict, unsafe { kCGWindowNumber })
+            .and_then(|number| u32::try_from(number).ok())
+            .and_then(spaces::on_current_space);
+        if cg_window_vetoes_quit(onscreen, on_current_space) {
             count += 1;
         }
     }
     Some(count)
 }
 
-fn dict_bool(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> bool {
+/// An offscreen window on the current Space is commonly a phantom or an app
+/// hiding instead of closing. Any other state is a conservative quit veto.
+fn cg_window_vetoes_quit(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
+    !matches!((onscreen, on_current_space), (Some(false), Some(true)))
+}
+
+fn dict_bool(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> Option<bool> {
     let value = unsafe { dict.value(key as *const _ as *const std::ffi::c_void) };
-    let Some(ptr) = std::ptr::NonNull::new(value.cast_mut()) else {
-        return false;
-    };
+    let ptr = std::ptr::NonNull::new(value.cast_mut())?;
     let value = unsafe { CFRetained::retain(ptr.cast::<CFType>()) };
     value
         .downcast::<objc2_core_foundation::CFBoolean>()
-        .is_ok_and(|boolean| boolean.as_bool())
+        .ok()
+        .map(|boolean| boolean.as_bool())
 }
 
 fn dict_i64(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> Option<i64> {
@@ -168,4 +176,28 @@ fn dict_f64(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> Optio
     let value = unsafe { CFRetained::retain(ptr.cast::<CFType>()) };
     let number = value.downcast::<CFNumber>().ok()?;
     number.as_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cg_window_vetoes_quit;
+
+    #[test]
+    fn visible_and_inactive_space_windows_veto_quit() {
+        assert!(cg_window_vetoes_quit(Some(true), Some(true)));
+        assert!(cg_window_vetoes_quit(Some(true), Some(false)));
+        assert!(cg_window_vetoes_quit(Some(false), Some(false)));
+    }
+
+    #[test]
+    fn uncertain_space_membership_fails_closed() {
+        assert!(cg_window_vetoes_quit(Some(false), None));
+        assert!(cg_window_vetoes_quit(None, Some(true)));
+        assert!(cg_window_vetoes_quit(None, None));
+    }
+
+    #[test]
+    fn only_ordered_out_current_space_windows_do_not_veto() {
+        assert!(!cg_window_vetoes_quit(Some(false), Some(true)));
+    }
 }

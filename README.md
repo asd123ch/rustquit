@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.3.4" src="https://img.shields.io/badge/version-0.3.4-2f81f7">
+  <img alt="Version 0.3.8" src="https://img.shields.io/badge/version-0.3.8-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-b7410e">
@@ -78,18 +78,16 @@ logs by default. Configuration stays in one user-only local TOML file. See
 - **Keep running** (the opposite direction): relaunch selected apps
   automatically when they quit, e.g. after a crash or an update. Apps on
   this list are never auto-quit — the two checkboxes are mutually
-  exclusive in the app list. Kept apps are also launched when RustQuit
-  starts and right when you check the box. Relaunches happen **hidden and
-  without stealing focus**: menu bar icons come back, but no settings or
-  main window ever pops up; a regular app waits in the Dock, one click
-  away. Menu bar apps come back after any termination; a regular
-  (Dock) app is only resurrected when it actually **crashed** — RustQuit
-  reads the exit status from the kernel, so quitting an app deliberately
-  (closing the settings window of a menu bar suite, ⌘Q, an updater) is
-  always respected. An optional restart-loop protection additionally stops
-  relaunching an app until the next day after two automatic restarts
-  within an hour; re-checking the Keep box lifts that pause immediately.
-- **Recently Quit menu**: the last few auto-quit apps, one click to reopen
+  exclusive in the app list. **Automatically start missing kept apps** also
+  restores apps that are already absent when RustQuit starts and relaunches
+  regular apps after normal quits. Relaunches happen **hidden and without
+  stealing focus**. A 24-hour ignore temporarily overrides Keep. Optional
+  restart-loop protection stops repeated automatic launches until the next
+  day.
+- **Recently Quit menu**: clicking an app name opens it immediately. Kept
+  apps also have a separate Keep Options submenu for a 24-hour ignore or an
+  early resume. Ignore deadlines persist across RustQuit restarts and expire
+  automatically.
 - **Launch at login** via SMAppService, toggled in Settings
 - **Menu bar status**: shows plainly when the Accessibility permission is
   missing, with a one-click jump to System Settings, and recovers
@@ -182,9 +180,9 @@ the engine idles and the menu bar item shows what to do.
 
 If you use the keep-running feature, macOS additionally asks for the
 **App Management permission** the first time RustQuit launches another app.
-Because kept apps are started at RustQuit startup and right when you check
-their box, that prompt appears while you are setting things up — not at the
-first crash.
+With automatic launching enabled, kept apps are restored shortly after
+RustQuit starts and right when you check their box, so that prompt appears
+while you are setting things up.
 
 ### Why the signing script matters
 
@@ -219,9 +217,11 @@ quit_delay_secs = 2.0
 enabled = true
 apps = ["com.apple.TextEdit"]
 keep_alive_enabled = true
+keep_alive_auto_start_missing = true
 keep_alive_delay_secs = 10.0
 keep_alive_loop_protection = true
 keep_alive_apps = []
+keep_alive_ignored_until = {}
 ```
 
 Values are validated on load and save. The file and its directory are created
@@ -267,17 +267,18 @@ vulnerability reporting for this repository instead of a public issue.
 
 RustQuit watches every regular app for window events. An event never quits
 anything directly — it only triggers a fresh count of the app's real
-windows. Minimized windows and windows on other Spaces count as open, and
-so does anything RustQuit cannot check reliably: when in doubt, the app
-stays. Windows an app only pretends to close (Discord hides its window
-instead of closing it) are recognized and ignored.
+windows. Minimized windows and windows on other Spaces count as open, and a
+Space switch immediately cancels every decision already in flight. Anything
+RustQuit cannot check reliably also counts as open: when in doubt, the app
+stays. Windows an app only pretends to close are ignored solely for a short
+built-in list and only while that app is actually reported hidden.
 
 Once the count reaches zero, RustQuit waits for the configured delay and
 then re-checks everything: the app must still be running, still windowless,
 not hidden with ⌘H, still a regular Dock app (an app that has switched to
 menu bar mode is left alone), and still allowed by the current settings, and
-the window server must agree that no visible window remains — including
-full-screen windows on other Spaces. Only then is the app asked to quit,
+the window server must agree that no visible window or window parked on an
+inactive Space remains. Only then is the app asked to quit,
 with the same polite request as pressing ⌘Q: save dialogs still appear and
 are never bypassed. The app lands in the "Recently Quit" menu once macOS
 confirms it actually terminated.
@@ -297,9 +298,9 @@ confirms it actually terminated.
   hiding it with ⌘H counts as closing it.
 - Quitting a kept **menu bar app** by hand brings it back after the
   restart delay — for an app without windows, RustQuit cannot tell that
-  quit from a crash worth undoing. Uncheck its Keep box (or flip the
-  "Keep Running" toggle) first. Regular Dock apps are not affected: their
-  deliberate quits are recognized via the exit status and respected.
+  quit from a crash worth undoing. With **Automatically start missing kept
+  apps** enabled, regular Dock apps also return after a deliberate quit.
+  Ignore the app for 24 hours or disable Keep before quitting it.
 - The settings window lists apps from `/Applications`,
   `/System/Applications` and `~/Applications`, including nested app folders
   up to two levels deep. Anything else can be added via "Add App…".

@@ -44,13 +44,19 @@ fn main() {
     let settings = settings_window::SettingsController::new(mtm, config.clone());
     let recent_quits = engine::recent::RecentQuits::new_handle();
 
-    // Must stay alive until run() ends (owns the status item, menu, target).
-    let tray = tray::Tray::setup(mtm, config.clone(), settings.clone(), recent_quits.clone());
-    settings.set_tray(tray.target_retained());
-
     // Relaunches keep-alive apps; independent of the engine and its
     // Accessibility permission. Must stay alive until run() ends.
     let keep_alive = keepalive::setup(config.clone(), recent_quits.clone());
+
+    // Must stay alive until run() ends (owns the status item, menu, target).
+    let tray = tray::Tray::setup(
+        mtm,
+        config.clone(),
+        settings.clone(),
+        recent_quits.clone(),
+        keep_alive.handle(),
+    );
+    settings.set_tray(tray.target_retained());
     settings.set_keep_alive(keep_alive.handle());
 
     // Debug helper: open the settings window right away.

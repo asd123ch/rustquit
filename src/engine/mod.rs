@@ -47,6 +47,14 @@ const RECOUNT_QUEUE_CAPACITY: usize = 256;
 /// closed the last window" instead of "the user hid the app".
 const CLOSE_TO_BACKGROUND_BUNDLE_IDS: &[&str] = &["com.hnc.discord"];
 
+fn is_close_to_background(bundle_id: Option<&str>) -> bool {
+    bundle_id.is_some_and(|id| {
+        CLOSE_TO_BACKGROUND_BUNDLE_IDS
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(id))
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RecountPhase {
     WindowDestroyed,
@@ -91,11 +99,20 @@ fn hidden_blocks_quit(watcher: &Watcher) -> bool {
         return true;
     }
     let bundle_id = watcher.app.bundleIdentifier().map(|b| b.to_string());
-    !bundle_id.as_deref().is_some_and(|id| {
-        CLOSE_TO_BACKGROUND_BUNDLE_IDS
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(id))
-    })
+    !is_close_to_background(bundle_id.as_deref())
+}
+
+/// Ordered-out standard windows are ambiguous: they may be app-internal
+/// close-to-background state, but during a Space transition a real window
+/// can briefly look exactly the same. Ignore them only for a known app that
+/// is also reported hidden; every other case stays alive.
+fn ordered_out_blocks_quit(watcher: &Watcher, ordered_out: usize) -> bool {
+    let bundle_id = watcher.app.bundleIdentifier().map(|b| b.to_string());
+    ordered_out_blocks_quit_for(bundle_id.as_deref(), watcher.app.isHidden(), ordered_out)
+}
+
+fn ordered_out_blocks_quit_for(bundle_id: Option<&str>, hidden: bool, ordered_out: usize) -> bool {
+    ordered_out != 0 && !(hidden && is_close_to_background(bundle_id))
 }
 
 fn decide_quit(config: &Config, bundle_id: Option<&str>) -> bool {
@@ -279,7 +296,8 @@ impl Engine {
         }
         if let Some(pending) = self.pending_terminations.borrow_mut().remove(&pid) {
             if pending.requested_at.elapsed().as_secs_f64() <= PENDING_TERMINATION_TIMEOUT_SECS {
-                self.recent_quits.push(pending.bundle_id, pending.name);
+                self.recent_quits
+                    .push_auto_quit(pending.bundle_id, pending.name);
             }
         }
     }
@@ -300,6 +318,19 @@ impl Engine {
 
     pub(crate) fn on_space_changed(&self) {
         self.last_space_change.set(Some(Instant::now()));
+        // AX and CG can briefly disagree while Mission Control moves windows
+        // between visible and inactive Spaces. Invalidate every queued recount
+        // and delayed quit immediately; only fresh post-transition evidence may
+        // start another decision.
+        let watchers = self.watchers.borrow();
+        for watcher in watchers.values() {
+            watcher.generation.set(self.next_generation());
+            watcher.last_ordered_out.set(0);
+        }
+        tracing::debug!(
+            apps = watchers.len(),
+            "active Space changed; cancelled pending quit checks"
+        );
     }
 
     fn space_change_recent(&self) -> bool {
@@ -474,7 +505,13 @@ impl Engine {
         // whose last recount saw an ordered-out standard window closed that
         // window; it did not get hidden by the user.
         watcher.last_ordered_out.set(count.ordered_out);
-        if count.effective != 0 {
+        if count.effective != 0 || ordered_out_blocks_quit(watcher, count.ordered_out) {
+            if count.ordered_out != 0 {
+                tracing::debug!(
+                    pid = request.pid,
+                    "quit cancelled: ambiguous offscreen window"
+                );
+            }
             return;
         }
 
@@ -641,7 +678,6 @@ mod tests {
     fn hard_exclusions_always_win() {
         let c = config(FilterMode::Blacklist, &[], true);
         assert!(!decide_quit(&c, Some("com.apple.finder")));
-        assert!(!decide_quit(&c, Some("ch.patrick.rustquit")));
         assert!(!decide_quit(&c, None));
     }
 
@@ -657,5 +693,29 @@ mod tests {
         c.mode = FilterMode::Whitelist;
         c.apps = vec!["com.hnc.Discord".into()];
         assert!(!decide_quit(&c, Some("com.hnc.Discord")));
+    }
+
+    #[test]
+    fn ordered_out_windows_only_count_as_closed_for_hidden_allowlisted_apps() {
+        assert!(!ordered_out_blocks_quit_for(
+            Some("com.hnc.Discord"),
+            true,
+            1
+        ));
+        assert!(ordered_out_blocks_quit_for(
+            Some("com.hnc.Discord"),
+            false,
+            1
+        ));
+        assert!(ordered_out_blocks_quit_for(
+            Some("com.example.App"),
+            true,
+            1
+        ));
+        assert!(!ordered_out_blocks_quit_for(
+            Some("com.example.App"),
+            false,
+            0
+        ));
     }
 }

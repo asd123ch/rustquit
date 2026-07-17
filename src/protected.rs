@@ -3,9 +3,11 @@
 //! Union of the hard-coded protection lists of SwiftQuit (Finder,
 //! Spotlight, Notification Center) and Quitty (plus SystemUIServer, Dock,
 //! Control Center, WindowManager, TextInputMenuAgent, System Events),
-//! extended with loginwindow and RustQuit itself. Enforced in three
-//! places: the quit decision, the settings app list (not shown at all),
-//! and the "Add App…" panel (warning popup).
+//! extended with loginwindow. RustQuit's own bundle ID is detected at
+//! runtime. Enforced in three places: the quit decision, the settings app
+//! list (not shown at all), and the "Add App…" panel (warning popup).
+
+use objc2_foundation::NSBundle;
 
 const PROTECTED_BUNDLE_IDS: &[&str] = &[
     // Core system UI — quitting these breaks the desktop.
@@ -33,13 +35,15 @@ const PROTECTED_BUNDLE_IDS: &[&str] = &[
     "com.apple.mobilephone",
     // Launcher stubs that never own real windows (listing them is noise).
     "com.apple.exposelauncher",
-    // RustQuit itself.
-    "ch.patrick.rustquit",
 ];
 
 /// Bundle IDs are matched case-insensitively (Apple is not consistent).
 pub fn is_protected_bundle_id(bundle_id: &str) -> bool {
     let lower = bundle_id.to_lowercase();
+    let own_bundle = NSBundle::mainBundle().bundleIdentifier();
+    if own_bundle.is_some_and(|own| own.to_string().eq_ignore_ascii_case(bundle_id)) {
+        return true;
+    }
     // The ".launcher" suffix marks stub apps that only trampoline into a
     // system service (Siri, Time Machine, Screenshot, Apps, …).
     lower.ends_with(".launcher") || PROTECTED_BUNDLE_IDS.contains(&lower.as_str())
@@ -68,7 +72,6 @@ mod tests {
         assert!(is_protected_bundle_id("com.apple.finder"));
         assert!(is_protected_bundle_id("com.apple.Spotlight"));
         assert!(is_protected_bundle_id("com.apple.WindowManager"));
-        assert!(is_protected_bundle_id("ch.patrick.rustquit"));
     }
 
     #[test]

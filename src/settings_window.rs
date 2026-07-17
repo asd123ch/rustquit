@@ -80,6 +80,7 @@ pub struct SettingsIvars {
     autostart_checkbox: RefCell<Option<Retained<NSButton>>>,
     enabled_checkbox: RefCell<Option<Retained<NSButton>>>,
     keep_alive_checkbox: RefCell<Option<Retained<NSButton>>>,
+    auto_start_missing_checkbox: RefCell<Option<Retained<NSButton>>>,
     restart_delay_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     loop_protection_checkbox: RefCell<Option<Retained<NSButton>>>,
     /// Menu bar target, informed after toggles so the icon and the menu
@@ -217,6 +218,29 @@ define_class!(
             self.notify_tray();
         }
 
+        #[unsafe(method(onAutoStartMissingKeptAppsChanged:))]
+        fn on_auto_start_missing_kept_apps_changed(&self, sender: Option<&NSButton>) {
+            let Some(sender) = sender else { return };
+            let wanted = sender.state() == NSControlStateValueOn;
+            match self
+                .ivars()
+                .config
+                .update(|config| config.keep_alive_auto_start_missing = wanted)
+            {
+                Ok(()) => {
+                    if wanted {
+                        if let Some(keep_alive) = self.ivars().keep_alive.borrow().as_ref() {
+                            keep_alive.reconcile_missing_apps();
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(%err, "cannot persist automatic Keep launch state");
+                    self.sync_controls();
+                }
+            }
+        }
+
         #[unsafe(method(onLoopProtectionChanged:))]
         fn on_loop_protection_changed(&self, sender: Option<&NSButton>) {
             let Some(sender) = sender else { return };
@@ -339,6 +363,7 @@ impl SettingsController {
             autostart_checkbox: RefCell::new(None),
             enabled_checkbox: RefCell::new(None),
             keep_alive_checkbox: RefCell::new(None),
+            auto_start_missing_checkbox: RefCell::new(None),
             restart_delay_popup: RefCell::new(None),
             loop_protection_checkbox: RefCell::new(None),
             tray: RefCell::new(None),
@@ -731,6 +756,13 @@ impl SettingsController {
         if let Some(checkbox) = ivars.keep_alive_checkbox.borrow().as_ref() {
             checkbox.setState(if config.keep_alive_enabled { on } else { off });
         }
+        if let Some(checkbox) = ivars.auto_start_missing_checkbox.borrow().as_ref() {
+            checkbox.setState(if config.keep_alive_auto_start_missing {
+                on
+            } else {
+                off
+            });
+        }
         if let Some(checkbox) = ivars.loop_protection_checkbox.borrow().as_ref() {
             checkbox.setState(if config.keep_alive_loop_protection {
                 on
@@ -873,6 +905,15 @@ impl SettingsController {
         );
         stack.addArrangedSubview(&keep_alive);
         self.ivars().keep_alive_checkbox.replace(Some(keep_alive));
+
+        let auto_start_missing = checkbox(
+            "Automatically start missing kept apps",
+            sel!(onAutoStartMissingKeptAppsChanged:),
+        );
+        stack.addArrangedSubview(&auto_start_missing);
+        self.ivars()
+            .auto_start_missing_checkbox
+            .replace(Some(auto_start_missing));
 
         let restart_popup = delay_popup(RESTART_DELAY_CHOICES, sel!(onRestartDelayChanged:));
         let restart_row = labeled_row("Restart delay:", &restart_popup);
