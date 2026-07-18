@@ -40,8 +40,8 @@ pub struct Config {
     pub apps: Vec<String>,
     /// Master toggle for relaunching the keep-alive apps.
     pub keep_alive_enabled: bool,
-    /// Relaunch kept apps after any termination and restore missing ones
-    /// when RustQuit starts.
+    /// Restore missing kept apps when RustQuit starts, unless a related
+    /// background helper already keeps the app suite running.
     #[serde(alias = "keep_alive_launch_at_startup")]
     pub keep_alive_auto_start_missing: bool,
     /// Wait after a keep-alive app terminates before relaunching it, so

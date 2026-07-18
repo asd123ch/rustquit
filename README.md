@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.3.8" src="https://img.shields.io/badge/version-0.3.8-2f81f7">
+  <img alt="Version 0.3.9" src="https://img.shields.io/badge/version-0.3.9-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-b7410e">
@@ -77,22 +77,24 @@ logs by default. Configuration stays in one user-only local TOML file. See
   plus "Add App…" for anything outside the standard folders
 - **Keep running** (the opposite direction): relaunch selected apps
   automatically when they quit, e.g. after a crash or an update. Apps on
-  this list are never auto-quit — the two checkboxes are mutually
-  exclusive in the app list. **Automatically start missing kept apps** also
-  restores apps that are already absent when RustQuit starts and relaunches
-  regular apps after normal quits. Relaunches happen **hidden and without
+  this list are never auto-quit — the two checkboxes are mutually exclusive
+  in the app list. **Automatically start missing kept apps** also restores
+  apps that are already absent when RustQuit starts and relaunches regular
+  apps after normal quits. A related external menu bar helper counts as the
+  app suite still running, so closing a settings frontend leaves it closed.
+  Relaunches happen **hidden and without
   stealing focus**. A 24-hour ignore temporarily overrides Keep. Optional
   restart-loop protection stops repeated automatic launches until the next
   day.
-- **Recently Quit menu**: clicking an app name opens it immediately. Kept
-  apps also have a separate Keep Options submenu for a 24-hour ignore or an
-  early resume. Ignore deadlines persist across RustQuit restarts and expire
+- **Recently Quit menu**: each app appears once. Kept apps expose Open and a
+  24-hour Ignore/Resume action directly in their submenu; other apps open
+  immediately. Ignore deadlines persist across RustQuit restarts and expire
   automatically.
 - **Launch at login** via SMAppService, toggled in Settings
-- **Menu bar status**: shows plainly when the Accessibility permission is
-  missing, with a one-click jump to System Settings, and recovers
-  automatically once granted (no restart needed). The icon dims while
-  auto-quit is disabled.
+- **Menu bar status**: shows a single warning submenu only when Accessibility
+  access or Launch at Login approval is missing, with direct links to the
+  relevant System Settings panes. It disappears automatically when everything
+  is ready. The icon dims while auto-quit is disabled.
 - **Single instance**: an OS file lock prevents launch races
 - Only regular apps (with a Dock presence) are ever considered; menu bar
   utilities, background services and apps without a bundle ID are ignored
@@ -178,11 +180,10 @@ On first launch, macOS asks for the **Accessibility permission**
 observe window events; that is the entire reason it exists. Until granted,
 the engine idles and the menu bar item shows what to do.
 
-If you use the keep-running feature, macOS additionally asks for the
-**App Management permission** the first time RustQuit launches another app.
-With automatic launching enabled, kept apps are restored shortly after
-RustQuit starts and right when you check their box, so that prompt appears
-while you are setting things up.
+RustQuit does not modify or delete other app bundles, so it does not require
+the **App Management** permission. Keep uses the standard NSWorkspace launch
+API. When Launch at Login has been registered but still needs user approval,
+the menu warning links directly to the Login Items pane.
 
 ### Why the signing script matters
 
@@ -299,8 +300,9 @@ confirms it actually terminated.
 - Quitting a kept **menu bar app** by hand brings it back after the
   restart delay — for an app without windows, RustQuit cannot tell that
   quit from a crash worth undoing. With **Automatically start missing kept
-  apps** enabled, regular Dock apps also return after a deliberate quit.
-  Ignore the app for 24 hours or disable Keep before quitting it.
+  apps** enabled, regular Dock apps also return after a deliberate quit,
+  unless a related external menu bar helper is already running. In that
+  case, closing the settings frontend does not reopen it.
 - The settings window lists apps from `/Applications`,
   `/System/Applications` and `~/Applications`, including nested app folders
   up to two levels deep. Anything else can be added via "Add App…".

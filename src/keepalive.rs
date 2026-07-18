@@ -1,5 +1,5 @@
-//! Keep-alive: relaunches selected apps when they terminate (crash, updater
-//! quit, accidental ⌘Q).
+//! Keep-alive: relaunches selected apps when they terminate, while treating
+//! related external background helpers as satisfying Keep.
 //!
 //! Terminations are detected by observing `NSWorkspace.runningApplications`
 //! via key-value observing and diffing against the last snapshot. The
@@ -20,6 +20,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -392,8 +393,8 @@ impl KeepAlive {
 
     /// The user just checked the Keep box: that explicit intent overrides
     /// loop protection, but respects a separately requested 24-hour ignore.
-    /// Otherwise the launch happens right away and raises the App Management
-    /// permission prompt up front, not at the first crash.
+    /// Otherwise the launch happens right away, so failures surface while
+    /// Keep is being configured rather than at the first crash.
     pub fn keep_checked(&self, bundle_id: &str) {
         let key = bundle_id.to_ascii_lowercase();
         self.paused_until.borrow_mut().remove(&key);
@@ -456,8 +457,16 @@ impl KeepAlive {
             tracing::warn!(bundle_id, "keep-alive: app not found, cannot restart");
             return false;
         };
-        // Launch hidden and without stealing focus; errors (e.g. a missing
-        // App Management permission) surface in the completion handler.
+        let target_path = url.path().map(|path| path.to_string()).unwrap_or_default();
+        if background_suite_running(bundle_id, &target_path) {
+            tracing::debug!(
+                bundle_id,
+                "keep-alive: related background process is already running"
+            );
+            return false;
+        }
+        // Launch hidden and without stealing focus; errors surface in the
+        // completion handler.
         let configuration = NSWorkspaceOpenConfiguration::configuration();
         configuration.setActivates(false);
         configuration.setHides(true);
@@ -597,4 +606,61 @@ impl KeepAlive {
 
 fn is_listed(list: &[String], bundle_id: &str) -> bool {
     list.iter().any(|b| b.eq_ignore_ascii_case(bundle_id))
+}
+
+/// Settings frontends often exit while a separately installed menu bar
+/// helper keeps the product alive. Treat a related accessory app as the
+/// selected app already running, without maintaining product-specific IDs.
+fn background_suite_running(target_bundle_id: &str, target_path: &str) -> bool {
+    let bundle_prefix = format!("{}.", target_bundle_id.to_ascii_lowercase());
+    let target_name = Path::new(target_path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(normalized_app_name)
+        .filter(|name| name.len() >= 6);
+    let target_path = Path::new(target_path);
+
+    NSWorkspace::sharedWorkspace()
+        .runningApplications()
+        .iter()
+        .filter(|app| app.activationPolicy() != NSApplicationActivationPolicy::Regular)
+        .any(|app| {
+            let Some(helper_path) = app
+                .bundleURL()
+                .and_then(|url| url.path().map(|path| path.to_string()))
+            else {
+                return false;
+            };
+            let helper_path = Path::new(&helper_path);
+            if helper_path.starts_with(target_path) {
+                return false;
+            }
+
+            let related_bundle = app.bundleIdentifier().is_some_and(|bundle_id| {
+                bundle_id
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .starts_with(&bundle_prefix)
+            });
+            if related_bundle {
+                return true;
+            }
+
+            let Some(target_name) = target_name.as_ref() else {
+                return false;
+            };
+            helper_path.components().any(|component| {
+                component
+                    .as_os_str()
+                    .to_str()
+                    .is_some_and(|name| normalized_app_name(name).starts_with(target_name))
+            })
+        })
+}
+
+fn normalized_app_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
