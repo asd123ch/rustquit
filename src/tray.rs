@@ -28,8 +28,8 @@ pub struct TrayIvars {
     keep_alive_item: RefCell<Option<Retained<NSMenuItem>>>,
     status_button: RefCell<Option<Retained<NSStatusBarButton>>>,
     recent_menu: RefCell<Option<Retained<NSMenu>>>,
-    permission_warning_item: RefCell<Option<Retained<NSMenuItem>>>,
-    permission_open_item: RefCell<Option<Retained<NSMenuItem>>>,
+    permission_item: RefCell<Option<Retained<NSMenuItem>>>,
+    permission_menu: RefCell<Option<Retained<NSMenu>>>,
     permission_separator: RefCell<Option<Retained<NSMenuItem>>>,
 }
 
@@ -48,6 +48,7 @@ define_class!(
             // The main menu picks up config changes made in the settings
             // window; the recent submenu is rebuilt from scratch.
             self.sync_from_config();
+            self.set_accessibility_permission_ok(crate::permissions::is_trusted());
             self.rebuild_recent_menu(menu);
         }
     }
@@ -92,6 +93,11 @@ define_class!(
         #[unsafe(method(onOpenAccessibilitySettings:))]
         fn on_open_accessibility_settings(&self, _sender: Option<&AnyObject>) {
             crate::permissions::open_accessibility_settings();
+        }
+
+        #[unsafe(method(onOpenLoginItemsSettings:))]
+        fn on_open_login_items_settings(&self, _sender: Option<&AnyObject>) {
+            crate::autostart::open_settings();
         }
 
         #[unsafe(method(onReopenApp:))]
@@ -161,8 +167,8 @@ impl TrayTarget {
             keep_alive_item: RefCell::new(None),
             status_button: RefCell::new(None),
             recent_menu: RefCell::new(None),
-            permission_warning_item: RefCell::new(None),
-            permission_open_item: RefCell::new(None),
+            permission_item: RefCell::new(None),
+            permission_menu: RefCell::new(None),
             permission_separator: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
@@ -195,17 +201,41 @@ impl TrayTarget {
         }
     }
 
-    /// Shows or hides the "permission missing" menu section.
-    pub fn set_permission_ok(&self, ok: bool) {
+    /// Rebuilds the single warning submenu and hides it completely when all
+    /// permissions with a public status API are ready.
+    pub fn set_accessibility_permission_ok(&self, accessibility_ok: bool) {
         let ivars = self.ivars();
-        for slot in [
-            &ivars.permission_warning_item,
-            &ivars.permission_open_item,
-            &ivars.permission_separator,
-        ] {
-            if let Some(item) = slot.borrow().as_ref() {
-                item.setHidden(ok);
-            }
+        let Some(menu) = ivars.permission_menu.borrow().as_ref().cloned() else {
+            return;
+        };
+        menu.removeAllItems();
+
+        let mtm = MainThreadMarker::from(self);
+        let target_obj: &AnyObject = self;
+        if !accessibility_ok {
+            menu.addItem(&action_item(
+                "Accessibility Access Missing…",
+                sel!(onOpenAccessibilitySettings:),
+                target_obj,
+                mtm,
+            ));
+        }
+        let login_approval_required = crate::autostart::requires_approval();
+        if login_approval_required {
+            menu.addItem(&action_item(
+                "Approve Launch at Login…",
+                sel!(onOpenLoginItemsSettings:),
+                target_obj,
+                mtm,
+            ));
+        }
+
+        let hidden = accessibility_ok && !login_approval_required;
+        if let Some(item) = ivars.permission_item.borrow().as_ref() {
+            item.setHidden(hidden);
+        }
+        if let Some(separator) = ivars.permission_separator.borrow().as_ref() {
+            separator.setHidden(hidden);
         }
     }
 
@@ -239,15 +269,6 @@ impl TrayTarget {
         let target_obj: &AnyObject = self;
         for entry in entries {
             let title = format!("{} — {}", entry.name, age_label(entry.when));
-            let open = recent_action_item(
-                &title,
-                sel!(onReopenApp:),
-                &entry.bundle_id,
-                target_obj,
-                mtm,
-            );
-            menu.addItem(&open);
-
             let kept = ivars
                 .config
                 .data
@@ -258,28 +279,47 @@ impl TrayTarget {
             if kept {
                 let (label, action) = match ivars.keep_alive.ignore_remaining(&entry.bundle_id) {
                     Some(remaining) => (
-                        format!("Resume Keep Now ({} remaining)", duration_label(remaining)),
+                        format!(
+                            "Resume Keep for {} ({} remaining)",
+                            entry.name,
+                            duration_label(remaining)
+                        ),
                         sel!(onResumeKeepNow:),
                     ),
                     None => (
-                        "Ignore Keep for 24 Hours".to_string(),
+                        format!("Ignore {} for 24 Hours", entry.name),
                         sel!(onIgnoreKeepFor24Hours:),
                     ),
                 };
                 let ignore = recent_action_item(&label, action, &entry.bundle_id, target_obj, mtm);
                 let actions = NSMenu::new(mtm);
+                actions.addItem(&recent_action_item(
+                    &format!("Open {}", entry.name),
+                    sel!(onReopenApp:),
+                    &entry.bundle_id,
+                    target_obj,
+                    mtm,
+                ));
                 actions.addItem(&ignore);
 
-                let options = unsafe {
+                let app = unsafe {
                     NSMenuItem::initWithTitle_action_keyEquivalent(
                         NSMenuItem::alloc(mtm),
-                        &NSString::from_str(&format!("Keep Options — {}", entry.name)),
+                        &NSString::from_str(&title),
                         None,
                         ns_string!(""),
                     )
                 };
-                options.setSubmenu(Some(&actions));
-                menu.addItem(&options);
+                app.setSubmenu(Some(&actions));
+                menu.addItem(&app);
+            } else {
+                menu.addItem(&recent_action_item(
+                    &title,
+                    sel!(onReopenApp:),
+                    &entry.bundle_id,
+                    target_obj,
+                    mtm,
+                ));
             }
         }
     }
@@ -325,37 +365,27 @@ impl Tray {
         let menu = NSMenu::new(mtm);
         let target_obj: &AnyObject = &target;
 
-        // Permission section: only visible while the Accessibility
-        // permission is missing (set_permission_ok hides it).
-        let warning_item = unsafe {
+        // A single warning submenu, hidden together with its separator when
+        // every detectable permission is ready.
+        let permission_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                ns_string!("⚠️ Accessibility permission missing"),
+                ns_string!("⚠ Permissions Required"),
                 None,
                 ns_string!(""),
             )
         };
-        warning_item.setEnabled(false);
-        menu.addItem(&warning_item);
+        let permission_menu = NSMenu::new(mtm);
+        permission_item.setSubmenu(Some(&permission_menu));
+        menu.addItem(&permission_item);
         target
             .ivars()
-            .permission_warning_item
-            .replace(Some(warning_item));
-
-        let open_settings_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Open System Settings…"),
-                Some(sel!(onOpenAccessibilitySettings:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { open_settings_item.setTarget(Some(target_obj)) };
-        menu.addItem(&open_settings_item);
+            .permission_item
+            .replace(Some(permission_item));
         target
             .ivars()
-            .permission_open_item
-            .replace(Some(open_settings_item));
+            .permission_menu
+            .replace(Some(permission_menu));
 
         let permission_separator = NSMenuItem::separatorItem(mtm);
         menu.addItem(&permission_separator);
@@ -434,6 +464,7 @@ impl Tray {
         // changes made in the settings window show up immediately.
         menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
         target.sync_from_config();
+        target.set_accessibility_permission_ok(crate::permissions::is_trusted());
 
         status_item.setMenu(Some(&menu));
 
@@ -476,6 +507,24 @@ fn recent_action_item(
         item.setTarget(Some(target));
         item.setRepresentedObject(Some(&NSString::from_str(bundle_id)));
     }
+    item
+}
+
+fn action_item(
+    title: &str,
+    action: objc2::runtime::Sel,
+    target: &AnyObject,
+    mtm: MainThreadMarker,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(action),
+            ns_string!(""),
+        )
+    };
+    unsafe { item.setTarget(Some(target)) };
     item
 }
 

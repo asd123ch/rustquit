@@ -69,7 +69,7 @@ fn main() {
 
     if permissions::request_trust_with_prompt() {
         tracing::info!("Accessibility permission present");
-        tray.target().set_permission_ok(true);
+        tray.target().set_accessibility_permission_ok(true);
         match engine::Engine::start(config.clone(), recent_quits.clone()) {
             Ok(engine) => {
                 engine_slot.borrow_mut().replace(engine);
@@ -78,7 +78,7 @@ fn main() {
         }
     } else {
         tracing::warn!("Accessibility permission missing; waiting for it to be granted");
-        tray.target().set_permission_ok(false);
+        tray.target().set_accessibility_permission_ok(false);
     }
 
     // Reconcile permission changes for the whole lifetime. Revocation drops
@@ -91,7 +91,7 @@ fn main() {
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             engine::catch_callback_panic("permission watchdog", || {
                 let trusted = permissions::is_trusted();
-                target.set_permission_ok(trusted);
+                target.set_accessibility_permission_ok(trusted);
                 let running = slot.borrow().is_some();
                 match (trusted, running) {
                     (true, false) => {

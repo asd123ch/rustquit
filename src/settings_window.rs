@@ -87,7 +87,7 @@ pub struct SettingsIvars {
     /// checkmarks stay in sync with the settings window.
     tray: RefCell<Option<objc2::rc::Weak<crate::tray::TrayTarget>>>,
     /// Checking a Keep box launches the app right away when it is not
-    /// running (and triggers the App Management prompt up front).
+    /// running, so launch failures surface while it is being configured.
     keep_alive: RefCell<Option<std::rc::Rc<crate::keepalive::KeepAlive>>>,
 }
 
@@ -182,9 +182,8 @@ define_class!(
                 return;
             }
             if listed {
-                // A kept app should be running; launching it now also
-                // raises the App Management prompt at configuration time
-                // and lifts a loop-protection pause.
+                // A kept app should be running; launching it now surfaces
+                // failures at configuration time and lifts loop protection.
                 if let Some(keep_alive) = self.ivars().keep_alive.borrow().as_ref() {
                     keep_alive.keep_checked(&bundle_id);
                 }

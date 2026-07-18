@@ -7,6 +7,14 @@ pub fn is_enabled() -> bool {
     AppService::new(ServiceType::MainApp).status() == ServiceStatus::Enabled
 }
 
+pub fn requires_approval() -> bool {
+    AppService::new(ServiceType::MainApp).status() == ServiceStatus::RequiresApproval
+}
+
+pub fn open_settings() {
+    AppService::open_system_settings_login_items();
+}
+
 pub fn set_enabled(enabled: bool) -> bool {
     let service = AppService::new(ServiceType::MainApp);
     let result = if enabled {
