@@ -69,7 +69,7 @@ impl Watcher {
         app: Retained<NSRunningApplication>,
         engine: Weak<Engine>,
         generation: u64,
-    ) -> AxResult<Watcher> {
+    ) -> AxResult<(Watcher, bool)> {
         let pid = app.processIdentifier();
         let element = ax::application_element(pid);
         ax::nudge_electron(&element);
@@ -91,18 +91,16 @@ impl Watcher {
             last_ordered_out: Cell::new(0),
         };
 
-        // Register windows that are already open.
-        match ax::windows(&watcher.element) {
-            Ok(windows) => {
-                for window in windows {
-                    watcher.watch_window(window);
-                }
-            }
+        // Register windows that are already open. The app-level observer is
+        // active first, so a window created during this scan cannot be lost.
+        let windows_ready = match watcher.refresh_windows() {
+            Ok(()) => true,
             Err(err) => {
                 tracing::debug!(pid, ?err, "cannot read windows at watcher start");
+                false
             }
-        }
-        Ok(watcher)
+        };
+        Ok((watcher, windows_ready))
     }
 
     pub fn refcon(&self) -> *mut c_void {
@@ -114,17 +112,20 @@ impl Watcher {
         if self.watched_windows.borrow().iter().any(|w| **w == *window) {
             return;
         }
+        // Remember the standard window even if this app does not support a
+        // per-window destroy notification. The AppKit deactivation fallback
+        // can still recount it safely later.
+        if matches!(
+            ax::subrole(&window).as_deref(),
+            Ok(ax::SUBROLE_STANDARD_WINDOW)
+        ) {
+            self.had_window.set(true);
+        }
         match self
             .observer
             .add_notification(&window, ax::NOTIF_ELEMENT_DESTROYED, self.refcon())
         {
             Ok(()) => {
-                if matches!(
-                    ax::subrole(&window).as_deref(),
-                    Ok(ax::SUBROLE_STANDARD_WINDOW)
-                ) {
-                    self.had_window.set(true);
-                }
                 self.watched_windows.borrow_mut().push(window);
             }
             Err(err) => {
@@ -135,6 +136,15 @@ impl Watcher {
                 );
             }
         }
+    }
+
+    /// Synchronizes windows that were already present before the observer
+    /// became ready. Transient AX startup failures are retried by Engine.
+    pub fn refresh_windows(&self) -> AxResult<()> {
+        for window in ax::windows(&self.element)? {
+            self.watch_window(window);
+        }
+        Ok(())
     }
 
     /// Drops a destroyed window from the list.

@@ -4,8 +4,8 @@
 //! with close-to-background behaviour (Discord and other Electron apps)
 //! order their window out instead of destroying it, and such a hidden
 //! window stays in AXWindows forever. `effective_window_count` filters
-//! those out; `cg_window_count` is the independent second opinion an app
-//! must also pass (both zero) before it is quit.
+//! those out. `cg_window_count` is the independent second opinion before a
+//! quit; its strictness follows the strength of the triggering AX signal.
 
 use std::collections::HashSet;
 
@@ -16,6 +16,16 @@ use objc2_core_graphics::{
 };
 
 use super::{ax, spaces};
+
+#[derive(Clone, Copy, Debug)]
+pub enum CgWindowPolicy {
+    /// Protect every plausible visible or inactive-Space window.
+    Conservative,
+    /// AX confirmed that a window was destroyed. Only surfaces whose
+    /// visibility or Space membership confirms a real window may contradict
+    /// that strong signal.
+    Confirmed,
+}
 
 /// Result of a recount walk over the app's AX windows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,15 +121,16 @@ fn onscreen_window_ids(pid: libc::pid_t) -> Option<HashSet<u32>> {
     Some(ids)
 }
 
-/// Number of plausible normal windows of the pid according to the window
-/// server: layer == 0, alpha > 0, and either onscreen or assigned only to an
-/// inactive Space.
+/// Number of normal windows that veto a quit according to the selected policy.
+/// Candidates have layer == 0 and alpha > 0.
 ///
 /// Apps keep permanent phantom layer-0 windows, so not every offscreen window
 /// can veto a quit. SkyLight separates those still attached to a currently
 /// visible Space (ordered out / phantom) from real windows parked on another
-/// Desktop. Query failures count conservatively and keep the app alive.
-pub fn cg_window_count(pid: libc::pid_t) -> Option<usize> {
+/// Desktop. After AX explicitly reports a destroyed window, only a surface
+/// confirmed as onscreen or on an inactive Space overrides that stronger
+/// signal. Query failures always keep the app alive.
+pub fn cg_window_count(pid: libc::pid_t, policy: CgWindowPolicy) -> Option<usize> {
     let option = CGWindowListOption::OptionAll | CGWindowListOption::ExcludeDesktopElements;
     let list = CGWindowListCopyWindowInfo(option, kCGNullWindowID)?;
     let mut count = 0;
@@ -139,7 +150,7 @@ pub fn cg_window_count(pid: libc::pid_t) -> Option<usize> {
         let on_current_space = dict_i64(dict, unsafe { kCGWindowNumber })
             .and_then(|number| u32::try_from(number).ok())
             .and_then(spaces::on_current_space);
-        if cg_window_vetoes_quit(onscreen, on_current_space) {
+        if cg_window_vetoes_quit(onscreen, on_current_space, policy) {
             count += 1;
         }
     }
@@ -147,9 +158,22 @@ pub fn cg_window_count(pid: libc::pid_t) -> Option<usize> {
 }
 
 /// An offscreen window on the current Space is commonly a phantom or an app
-/// hiding instead of closing. Any other state is a conservative quit veto.
-fn cg_window_vetoes_quit(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
-    !matches!((onscreen, on_current_space), (Some(false), Some(true)))
+/// hiding instead of closing. The conservative policy protects every other
+/// state; destroyed-window evidence only accepts a confirmed user window.
+fn cg_window_vetoes_quit(
+    onscreen: Option<bool>,
+    on_current_space: Option<bool>,
+    policy: CgWindowPolicy,
+) -> bool {
+    match policy {
+        CgWindowPolicy::Conservative => {
+            !matches!((onscreen, on_current_space), (Some(false), Some(true)))
+        }
+        CgWindowPolicy::Confirmed => matches!(
+            (onscreen, on_current_space),
+            (Some(true), _) | (Some(false), Some(false))
+        ),
+    }
 }
 
 fn dict_bool(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> Option<bool> {
@@ -180,24 +204,40 @@ fn dict_f64(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::cg_window_vetoes_quit;
+    use super::{CgWindowPolicy, cg_window_vetoes_quit};
+
+    fn conservative(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
+        cg_window_vetoes_quit(onscreen, on_current_space, CgWindowPolicy::Conservative)
+    }
+
+    fn confirmed(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
+        cg_window_vetoes_quit(onscreen, on_current_space, CgWindowPolicy::Confirmed)
+    }
 
     #[test]
     fn visible_and_inactive_space_windows_veto_quit() {
-        assert!(cg_window_vetoes_quit(Some(true), Some(true)));
-        assert!(cg_window_vetoes_quit(Some(true), Some(false)));
-        assert!(cg_window_vetoes_quit(Some(false), Some(false)));
+        assert!(conservative(Some(true), Some(true)));
+        assert!(conservative(Some(true), Some(false)));
+        assert!(conservative(Some(false), Some(false)));
     }
 
     #[test]
     fn uncertain_space_membership_fails_closed() {
-        assert!(cg_window_vetoes_quit(Some(false), None));
-        assert!(cg_window_vetoes_quit(None, Some(true)));
-        assert!(cg_window_vetoes_quit(None, None));
+        assert!(conservative(Some(false), None));
+        assert!(conservative(None, Some(true)));
+        assert!(conservative(None, None));
     }
 
     #[test]
     fn only_ordered_out_current_space_windows_do_not_veto() {
-        assert!(!cg_window_vetoes_quit(Some(false), Some(true)));
+        assert!(!conservative(Some(false), Some(true)));
+    }
+
+    #[test]
+    fn destroyed_window_evidence_requires_confirmed_cg_vetoes() {
+        assert!(confirmed(Some(true), None));
+        assert!(confirmed(Some(false), Some(false)));
+        assert!(!confirmed(Some(false), Some(true)));
+        assert!(!confirmed(None, Some(false)));
     }
 }

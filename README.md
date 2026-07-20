@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.3.9" src="https://img.shields.io/badge/version-0.3.9-2f81f7">
+  <img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <img alt="Rust stable" src="https://img.shields.io/badge/Rust-stable-b7410e">

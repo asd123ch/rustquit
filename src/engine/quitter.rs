@@ -8,16 +8,22 @@ use std::rc::Weak;
 use block2::RcBlock;
 use objc2_foundation::NSTimer;
 
-use super::Engine;
+use super::{Engine, QuitEvidence};
 
-pub fn schedule(engine: Weak<Engine>, pid: libc::pid_t, generation: u64, delay_secs: f64) {
+pub fn schedule(
+    engine: Weak<Engine>,
+    pid: libc::pid_t,
+    generation: u64,
+    evidence: QuitEvidence,
+    delay_secs: f64,
+) {
     tracing::debug!(pid, delay_secs, "quit scheduled");
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         super::catch_callback_panic("quit timer", || {
             let Some(engine) = engine.upgrade() else {
                 return;
             };
-            engine.finish_quit(pid, generation);
+            engine.finish_quit(pid, generation, evidence);
         });
     });
     let _ =
