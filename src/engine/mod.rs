@@ -38,6 +38,8 @@ use recent::RecentQuitsHandle;
 const SPACE_CHANGE_GRACE_SECS: f64 = 3.0;
 const PENDING_TERMINATION_TIMEOUT_SECS: f64 = 30.0;
 const RECOUNT_QUEUE_CAPACITY: usize = 256;
+const WINDOW_SYNC_RETRY_SECS: f64 = 0.5;
+const WINDOW_SYNC_RETRY_LIMIT: u8 = 6;
 
 /// Apps that hide themselves when their last window is closed
 /// (close-to-background behaviour). From the outside, that state is
@@ -59,7 +61,13 @@ fn is_close_to_background(bundle_id: Option<&str>) -> bool {
 enum RecountPhase {
     WindowDestroyed,
     AppDeactivated,
-    FinalCheck,
+    FinalCheck(QuitEvidence),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum QuitEvidence {
+    WindowDestroyed,
+    AppDeactivated,
 }
 
 struct RecountRequest {
@@ -71,11 +79,9 @@ struct RecountRequest {
 struct RecountResult {
     request: RecountRequest,
     count: ax::AxResult<counter::WindowCount>,
-    /// Visible normal windows per the window server, computed on the
-    /// worker (the systemwide CGWindowList enumeration must not run on
-    /// the main thread). `None` if the window list was unavailable.
-    /// Vetoes the quit on a final check and feeds the "windowless before
-    /// termination" signal for keep-alive.
+    /// Normal windows that may contradict the triggering AX signal, computed
+    /// on the worker because CGWindowList enumeration must not run on the main
+    /// thread. `None` before the final check or if the list was unavailable.
     cg_count: Option<usize>,
 }
 
@@ -176,7 +182,18 @@ impl Engine {
             .spawn(move || {
                 while let Ok(request) = worker_rx.recv() {
                     let count = counter::effective_window_count(request.pid);
-                    let cg_count = counter::cg_window_count(request.pid);
+                    let cg_count = match request.phase {
+                        RecountPhase::FinalCheck(evidence) => {
+                            let policy = match evidence {
+                                QuitEvidence::WindowDestroyed => counter::CgWindowPolicy::Confirmed,
+                                QuitEvidence::AppDeactivated => {
+                                    counter::CgWindowPolicy::Conservative
+                                }
+                            };
+                            counter::cg_window_count(request.pid, policy)
+                        }
+                        RecountPhase::WindowDestroyed | RecountPhase::AppDeactivated => None,
+                    };
                     if worker_tx
                         .send(RecountResult {
                             request,
@@ -252,9 +269,12 @@ impl Engine {
         }
         let generation = self.next_generation();
         match Watcher::new(app.clone(), Rc::downgrade(self), generation) {
-            Ok(watcher) => {
+            Ok((watcher, windows_ready)) => {
                 tracing::debug!(pid, "watcher created");
                 self.watchers.borrow_mut().insert(pid, watcher);
+                if !windows_ready {
+                    self.schedule_window_sync(pid, 1);
+                }
             }
             Err(err) => {
                 // Affects only this one app; e.g. its AX tree is not ready
@@ -279,6 +299,44 @@ impl Engine {
                         )
                     };
                 }
+            }
+        }
+    }
+
+    fn schedule_window_sync(self: &Rc<Self>, pid: libc::pid_t, attempt: u8) {
+        let engine = Rc::downgrade(self);
+        let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            catch_callback_panic("window sync retry timer", || {
+                if let Some(engine) = engine.upgrade() {
+                    engine.retry_window_sync(pid, attempt);
+                }
+            });
+        });
+        let _ = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_repeats_block(
+                WINDOW_SYNC_RETRY_SECS,
+                false,
+                &block,
+            )
+        };
+    }
+
+    fn retry_window_sync(self: &Rc<Self>, pid: libc::pid_t, attempt: u8) {
+        let result = {
+            let watchers = self.watchers.borrow();
+            let Some(watcher) = watchers.get(&pid) else {
+                return;
+            };
+            watcher.refresh_windows()
+        };
+        match result {
+            Ok(()) => tracing::debug!(pid, attempt, "initial windows synchronized"),
+            Err(err) if attempt < WINDOW_SYNC_RETRY_LIMIT => {
+                tracing::debug!(pid, attempt, ?err, "initial window sync not ready");
+                self.schedule_window_sync(pid, attempt + 1);
+            }
+            Err(err) => {
+                tracing::debug!(pid, attempt, ?err, "initial window sync abandoned");
             }
         }
     }
@@ -395,7 +453,12 @@ impl Engine {
     }
 
     /// Second half of the quit path, runs after the delay has elapsed.
-    pub(crate) fn finish_quit(self: &Rc<Self>, pid: libc::pid_t, generation: u64) {
+    pub(crate) fn finish_quit(
+        self: &Rc<Self>,
+        pid: libc::pid_t,
+        generation: u64,
+        evidence: QuitEvidence,
+    ) {
         let watchers = self.watchers.borrow();
         let Some(watcher) = watchers.get(&pid) else {
             return;
@@ -422,6 +485,7 @@ impl Engine {
                 Rc::downgrade(self),
                 pid,
                 generation,
+                evidence,
                 SPACE_CHANGE_GRACE_SECS,
             );
             return;
@@ -430,7 +494,7 @@ impl Engine {
             return;
         }
         drop(watchers);
-        self.request_recount(pid, generation, RecountPhase::FinalCheck);
+        self.request_recount(pid, generation, RecountPhase::FinalCheck(evidence));
     }
 
     fn request_recount(self: &Rc<Self>, pid: libc::pid_t, generation: u64, phase: RecountPhase) {
@@ -521,11 +585,22 @@ impl Engine {
                     return;
                 }
                 let delay = self.config.data.borrow().quit_delay_secs.max(0.05);
-                quitter::schedule(Rc::downgrade(self), request.pid, request.generation, delay);
+                let evidence = match request.phase {
+                    RecountPhase::WindowDestroyed => QuitEvidence::WindowDestroyed,
+                    RecountPhase::AppDeactivated => QuitEvidence::AppDeactivated,
+                    RecountPhase::FinalCheck(_) => unreachable!(),
+                };
+                quitter::schedule(
+                    Rc::downgrade(self),
+                    request.pid,
+                    request.generation,
+                    evidence,
+                    delay,
+                );
             }
-            RecountPhase::FinalCheck => {
+            RecountPhase::FinalCheck(evidence) => {
                 drop(watchers);
-                self.finish_quit_after_recount(request.pid, request.generation, cg_count);
+                self.finish_quit_after_recount(request.pid, request.generation, evidence, cg_count);
             }
         }
     }
@@ -534,6 +609,7 @@ impl Engine {
         self: &Rc<Self>,
         pid: libc::pid_t,
         generation: u64,
+        evidence: QuitEvidence,
         cg_count: Option<usize>,
     ) {
         let watchers = self.watchers.borrow();
@@ -554,6 +630,7 @@ impl Engine {
                 Rc::downgrade(self),
                 pid,
                 generation,
+                evidence,
                 SPACE_CHANGE_GRACE_SECS,
             );
             return;
