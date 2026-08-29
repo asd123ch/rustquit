@@ -135,10 +135,10 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     };
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    let log_dir = dirs::home_dir().map(|home| home.join("Library/Logs/rustquit"));
+    let log_dir = crate::config::home_dir().map(|home| home.join("Library/Logs/rustquit"));
     if let Some(dir) = log_dir.as_deref() {
         if dir.exists() {
-            secure_and_prune_logs(dir);
+            secure_logs(dir);
         }
     }
 
@@ -154,7 +154,7 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
                 .max_log_files(7)
                 .build(&dir)
                 .ok()?;
-            secure_and_prune_logs(&dir);
+            secure_logs(&dir);
             Some(tracing_appender::non_blocking(appender))
         })
         .flatten();
@@ -182,30 +182,20 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     }
 }
 
-fn secure_and_prune_logs(dir: &std::path::Path) {
+fn secure_logs(dir: &std::path::Path) {
     use std::os::unix::fs::PermissionsExt;
 
     let _ = crate::config::create_private_dir(dir);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut logs: Vec<_> = entries
-        .flatten()
-        .filter(|entry| {
-            entry.file_type().is_ok_and(|kind| kind.is_file())
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("rustquit.log"))
-        })
-        .map(|entry| entry.path())
-        .collect();
-    logs.sort();
-    let remove_count = logs.len().saturating_sub(7);
-    for path in logs.iter().take(remove_count) {
-        let _ = std::fs::remove_file(path);
-    }
-    for path in logs.iter().skip(remove_count) {
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    for entry in entries.flatten().filter(|entry| {
+        entry.file_type().is_ok_and(|kind| kind.is_file())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("rustquit.log"))
+    }) {
+        let _ = std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o600));
     }
 }

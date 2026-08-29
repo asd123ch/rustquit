@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 pub struct InstanceGuard {
-    file: File,
+    _file: File,
 }
 
 impl InstanceGuard {
@@ -25,7 +25,7 @@ impl InstanceGuard {
             .open(dir.join("instance.lock"))?;
         let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if result == 0 {
-            Ok(Some(Self { file }))
+            Ok(Some(Self { _file: file }))
         } else {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
@@ -34,12 +34,6 @@ impl InstanceGuard {
                 Err(err)
             }
         }
-    }
-}
-
-impl Drop for InstanceGuard {
-    fn drop(&mut self) {
-        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 

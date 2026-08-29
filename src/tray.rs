@@ -216,6 +216,7 @@ impl TrayTarget {
             menu.addItem(&action_item(
                 "Accessibility Access Missing…",
                 sel!(onOpenAccessibilitySettings:),
+                None,
                 target_obj,
                 mtm,
             ));
@@ -225,6 +226,7 @@ impl TrayTarget {
             menu.addItem(&action_item(
                 "Approve Launch at Login…",
                 sel!(onOpenLoginItemsSettings:),
+                None,
                 target_obj,
                 mtm,
             ));
@@ -291,12 +293,12 @@ impl TrayTarget {
                         sel!(onIgnoreKeepFor24Hours:),
                     ),
                 };
-                let ignore = recent_action_item(&label, action, &entry.bundle_id, target_obj, mtm);
+                let ignore = action_item(&label, action, Some(&entry.bundle_id), target_obj, mtm);
                 let actions = NSMenu::new(mtm);
-                actions.addItem(&recent_action_item(
+                actions.addItem(&action_item(
                     &format!("Open {}", entry.name),
                     sel!(onReopenApp:),
-                    &entry.bundle_id,
+                    Some(&entry.bundle_id),
                     target_obj,
                     mtm,
                 ));
@@ -313,10 +315,10 @@ impl TrayTarget {
                 app.setSubmenu(Some(&actions));
                 menu.addItem(&app);
             } else {
-                menu.addItem(&recent_action_item(
+                menu.addItem(&action_item(
                     &title,
                     sel!(onReopenApp:),
-                    &entry.bundle_id,
+                    Some(&entry.bundle_id),
                     target_obj,
                     mtm,
                 ));
@@ -488,10 +490,10 @@ fn represented_bundle_id(sender: Option<&NSMenuItem>) -> Option<String> {
     object.downcast::<NSString>().ok().map(|id| id.to_string())
 }
 
-fn recent_action_item(
+fn action_item(
     title: &str,
     action: objc2::runtime::Sel,
-    bundle_id: &str,
+    represented_bundle_id: Option<&str>,
     target: &AnyObject,
     mtm: MainThreadMarker,
 ) -> Retained<NSMenuItem> {
@@ -505,26 +507,10 @@ fn recent_action_item(
     };
     unsafe {
         item.setTarget(Some(target));
-        item.setRepresentedObject(Some(&NSString::from_str(bundle_id)));
+        if let Some(bundle_id) = represented_bundle_id {
+            item.setRepresentedObject(Some(&NSString::from_str(bundle_id)));
+        }
     }
-    item
-}
-
-fn action_item(
-    title: &str,
-    action: objc2::runtime::Sel,
-    target: &AnyObject,
-    mtm: MainThreadMarker,
-) -> Retained<NSMenuItem> {
-    let item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
-            Some(action),
-            ns_string!(""),
-        )
-    };
-    unsafe { item.setTarget(Some(target)) };
     item
 }
 

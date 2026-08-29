@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use objc2_foundation::NSFileManager;
 use serde::{Deserialize, Serialize};
 
 const MAX_APPS: usize = 4096;
@@ -212,12 +213,19 @@ impl ConfigStore {
 }
 
 pub fn app_support_dir() -> PathBuf {
-    dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|home| home.join("Library/Application Support")))
+    home_dir()
+        .map(|home| home.join("Library/Application Support/rustquit"))
         .unwrap_or_else(|| {
             std::env::temp_dir().join(format!("rustquit-uid-{}", unsafe { libc::geteuid() }))
         })
-        .join("rustquit")
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    let file_manager = NSFileManager::defaultManager();
+    file_manager
+        .homeDirectoryForCurrentUser()
+        .path()
+        .map(|path| PathBuf::from(path.to_string()))
 }
 
 pub fn create_private_dir(path: &std::path::Path) -> io::Result<()> {

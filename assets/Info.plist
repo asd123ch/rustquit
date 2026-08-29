@@ -8,6 +8,8 @@
 	<string>rustquit</string>
 	<key>CFBundleIdentifier</key>
 	<string>ch.asd123.rustquit</string>
+	<key>CFBundleIconFile</key>
+	<string>RustQuit</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

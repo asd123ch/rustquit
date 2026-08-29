@@ -1,7 +1,7 @@
 //! Native settings window: mode, delay, launch at login, and the app list
 //! with checkboxes. The window is built once and then only shown/hidden.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::sync::mpsc::{self, Receiver};
 
 use objc2::rc::{Retained, Weak, autoreleasepool};
@@ -57,16 +57,13 @@ struct AppEntry {
     icon_path: Option<String>,
 }
 
-type ScanResult = (u64, Vec<AppEntry>);
-
 pub struct SettingsIvars {
     config: ConfigHandle,
     entries: RefCell<Vec<AppEntry>>,
     all_entries: RefCell<Vec<AppEntry>>,
     search_field: RefCell<Option<Retained<objc2_app_kit::NSSearchField>>>,
     only_selected_checkbox: RefCell<Option<Retained<NSButton>>>,
-    scan_generation: Cell<u64>,
-    scan_rx: RefCell<Option<Receiver<ScanResult>>>,
+    scan_rx: RefCell<Option<Receiver<Vec<AppEntry>>>>,
     scan_timer: RefCell<Option<Retained<objc2_foundation::NSTimer>>>,
     window: RefCell<Option<Retained<NSWindow>>>,
     table: RefCell<Option<Retained<NSTableView>>>,
@@ -112,7 +109,7 @@ define_class!(
     unsafe impl NSWindowDelegate for SettingsController {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
-            self.cancel_refresh();
+            self.finish_refresh();
             self.ivars().entries.borrow_mut().clear();
             self.ivars().all_entries.borrow_mut().clear();
             if let Some(field) = self.ivars().search_field.borrow().as_ref() {
@@ -349,7 +346,6 @@ impl SettingsController {
             all_entries: RefCell::new(Vec::new()),
             search_field: RefCell::new(None),
             only_selected_checkbox: RefCell::new(None),
-            scan_generation: Cell::new(0),
             scan_rx: RefCell::new(None),
             scan_timer: RefCell::new(None),
             window: RefCell::new(None),
@@ -527,15 +523,13 @@ impl SettingsController {
             return;
         }
 
-        let generation = self.ivars().scan_generation.get().wrapping_add(1);
-        self.ivars().scan_generation.set(generation);
         let (tx, rx) = mpsc::channel();
         self.ivars().scan_rx.replace(Some(rx));
         let spawn = std::thread::Builder::new()
             .name("rustquit-app-scan".to_string())
             .spawn(move || {
                 let entries = autoreleasepool(|_| scan_standard_apps());
-                let _ = tx.send((generation, entries));
+                let _ = tx.send(entries);
             });
         if let Err(err) = spawn {
             self.ivars().scan_rx.borrow_mut().take();
@@ -567,11 +561,9 @@ impl SettingsController {
             receiver.as_ref().map(Receiver::try_recv)
         };
         match result {
-            Some(Ok((generation, entries))) => {
+            Some(Ok(entries)) => {
                 self.finish_refresh();
-                if generation == self.ivars().scan_generation.get() {
-                    self.complete_refresh(entries);
-                }
+                self.complete_refresh(entries);
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => self.finish_refresh(),
             Some(Err(mpsc::TryRecvError::Empty)) | None => {}
@@ -585,13 +577,6 @@ impl SettingsController {
         }
     }
 
-    fn cancel_refresh(&self) {
-        self.ivars()
-            .scan_generation
-            .set(self.ivars().scan_generation.get().wrapping_add(1));
-        self.finish_refresh();
-    }
-
     /// Adds running apps and configured leftovers on the main thread, then
     /// publishes the completed list to the table.
     fn complete_refresh(&self, mut entries: Vec<AppEntry>) {
@@ -601,7 +586,7 @@ impl SettingsController {
             .collect();
 
         // Running apps that are not in the standard folders.
-        for app in engine::regular_running_apps_public() {
+        for app in engine::workspace::regular_running_apps() {
             let Some(bundle_id) = app.bundleIdentifier() else {
                 continue;
             };
@@ -1079,7 +1064,7 @@ fn scan_standard_apps() -> Vec<AppEntry> {
         std::path::PathBuf::from("/System/Applications"),
         std::path::PathBuf::from("/System/Applications/Utilities"),
     ];
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         app_dirs.push(home.join("Applications"));
     }
     for dir in app_dirs {

@@ -18,16 +18,12 @@ rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/rustquit "$APP/Contents/MacOS/rustquit"
 cp assets/Info.plist "$APP/Contents/Info.plist"
-cp LICENSE "$APP/Contents/Resources/LICENSE" 2>/dev/null || true
+cp LICENSE "$APP/Contents/Resources/LICENSE"
+cp assets/RustQuit.icns "$APP/Contents/Resources/RustQuit.icns"
 
 # Single source of truth for the version is Cargo.toml.
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" \
                         -c "Set :CFBundleVersion $VERSION" "$APP/Contents/Info.plist"
-
-if [ -f assets/RustQuit.icns ]; then
-    cp assets/RustQuit.icns "$APP/Contents/Resources/RustQuit.icns"
-    /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string RustQuit" "$APP/Contents/Info.plist" 2>/dev/null || true
-fi
 
 IDENTITY="-"
 KC="$HOME/Library/Keychains/rustquit-signing.keychain-db"

@@ -59,9 +59,6 @@ pub struct Watcher {
     pub had_window: Cell<bool>,
     /// Invalidates delayed quit checks when something happens in between.
     pub generation: Cell<u64>,
-    /// Ordered-out standard windows seen by the most recent recount; feeds
-    /// the close-to-background exception of the hidden-app guard.
-    pub last_ordered_out: Cell<usize>,
 }
 
 impl Watcher {
@@ -88,7 +85,6 @@ impl Watcher {
             watched_windows: RefCell::new(Vec::new()),
             had_window: Cell::new(false),
             generation: Cell::new(generation),
-            last_ordered_out: Cell::new(0),
         };
 
         // Register windows that are already open. The app-level observer is

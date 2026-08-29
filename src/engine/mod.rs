@@ -27,7 +27,6 @@ use objc2_core_foundation::CFRetained;
 use objc2_foundation::NSTimer;
 
 use watcher::Watcher;
-pub use workspace::regular_running_apps as regular_running_apps_public;
 
 use crate::config::{Config, ConfigHandle, FilterMode};
 use recent::RecentQuitsHandle;
@@ -68,6 +67,11 @@ enum RecountPhase {
 pub(crate) enum QuitEvidence {
     WindowDestroyed,
     AppDeactivated,
+    /// The app hid after deactivation and two AX recounts found no standard
+    /// windows. This is stronger than deactivation alone: stale CG surfaces
+    /// without an onscreen flag may be ignored, while visible and confirmed
+    /// inactive-Space windows still veto the quit.
+    HiddenWindowless,
 }
 
 struct RecountRequest {
@@ -90,22 +94,6 @@ struct PendingTermination {
     name: String,
     generation: u64,
     requested_at: Instant,
-}
-
-/// Pure filter decision; used by should_quit and unit-tested on its own.
-/// Cmd+H must never lead to a quit (Quitty-inspired guard) — except for
-/// close-to-background apps whose last recount excluded an ordered-out
-/// standard window: there the hide was the app's own reaction to its last
-/// window being closed, which is exactly the case RustQuit exists for.
-fn hidden_blocks_quit(watcher: &Watcher) -> bool {
-    if !watcher.app.isHidden() {
-        return false;
-    }
-    if watcher.last_ordered_out.get() == 0 {
-        return true;
-    }
-    let bundle_id = watcher.app.bundleIdentifier().map(|b| b.to_string());
-    !is_close_to_background(bundle_id.as_deref())
 }
 
 /// Ordered-out standard windows are ambiguous: they may be app-internal
@@ -185,7 +173,9 @@ impl Engine {
                     let cg_count = match request.phase {
                         RecountPhase::FinalCheck(evidence) => {
                             let policy = match evidence {
-                                QuitEvidence::WindowDestroyed => counter::CgWindowPolicy::Confirmed,
+                                QuitEvidence::WindowDestroyed | QuitEvidence::HiddenWindowless => {
+                                    counter::CgWindowPolicy::Confirmed
+                                }
                                 QuitEvidence::AppDeactivated => {
                                     counter::CgWindowPolicy::Conservative
                                 }
@@ -383,7 +373,6 @@ impl Engine {
         let watchers = self.watchers.borrow();
         for watcher in watchers.values() {
             watcher.generation.set(self.next_generation());
-            watcher.last_ordered_out.set(0);
         }
         tracing::debug!(
             apps = watchers.len(),
@@ -474,10 +463,6 @@ impl Engine {
         if watcher.app.isTerminated() || !watcher.app.isFinishedLaunching() {
             return;
         }
-        if hidden_blocks_quit(watcher) {
-            tracing::debug!(pid, "quit cancelled: app is hidden");
-            return;
-        }
         // AX events around Space switches are unreliable; defer, re-check later.
         if self.space_change_recent() {
             tracing::debug!(pid, "quit deferred: active Space changed recently");
@@ -565,10 +550,6 @@ impl Engine {
             ?cg_count,
             "recount result"
         );
-        // Remembered for the hidden-app guard: a close-to-background app
-        // whose last recount saw an ordered-out standard window closed that
-        // window; it did not get hidden by the user.
-        watcher.last_ordered_out.set(count.ordered_out);
         if count.effective != 0 || ordered_out_blocks_quit(watcher, count.ordered_out) {
             if count.ordered_out != 0 {
                 tracing::debug!(
@@ -587,6 +568,9 @@ impl Engine {
                 let delay = self.config.data.borrow().quit_delay_secs.max(0.05);
                 let evidence = match request.phase {
                     RecountPhase::WindowDestroyed => QuitEvidence::WindowDestroyed,
+                    RecountPhase::AppDeactivated if watcher.app.isHidden() => {
+                        QuitEvidence::HiddenWindowless
+                    }
                     RecountPhase::AppDeactivated => QuitEvidence::AppDeactivated,
                     RecountPhase::FinalCheck(_) => unreachable!(),
                 };
@@ -620,7 +604,6 @@ impl Engine {
             || !self.should_quit(watcher)
             || watcher.app.isTerminated()
             || !watcher.app.isFinishedLaunching()
-            || hidden_blocks_quit(watcher)
             || self.pending_terminations.borrow().contains_key(&pid)
         {
             return;

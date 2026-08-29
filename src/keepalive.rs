@@ -411,11 +411,6 @@ impl KeepAlive {
             tracing::debug!("automatic launch of missing kept apps disabled");
             return;
         }
-        self.reconcile();
-    }
-
-    /// Launches every non-ignored keep-alive app that is not running.
-    pub fn reconcile(&self) {
         let listed: Vec<String> = self.config.data.borrow().keep_alive_apps.clone();
         for bundle_id in listed {
             if !self.is_paused(&bundle_id) {
