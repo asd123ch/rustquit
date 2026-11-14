@@ -4,7 +4,7 @@ cask "rustquit" do
 
   url "https://github.com/asd123ch/rustquit/releases/download/v#{version}/RustQuit-#{version}.dmg"
   name "RustQuit"
-  desc "Quit macOS apps after their last window closes"
+  desc "Quit apps after their last window closes"
   homepage "https://github.com/asd123ch/rustquit"
 
   livecheck do
