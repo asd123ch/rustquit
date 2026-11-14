@@ -25,6 +25,7 @@ use objc2_core_foundation::{CFArray, CFNumber, CFRetained};
 /// `SLSCopySpacesForWindows` selection mask for Spaces that are currently
 /// visible on any display ("current" Spaces).
 const SPACE_MASK_CURRENT: i32 = 5;
+const SPACE_MASK_ALL: i32 = 7;
 
 type MainConnectionIdFn = unsafe extern "C" fn() -> i32;
 type CopySpacesForWindowsFn =
@@ -78,15 +79,25 @@ fn load() -> Option<SkyLight> {
 /// some display. `None` if SkyLight is unavailable or the query failed.
 ///
 /// A window that is *not* onscreen yet still on a current Space has been
-/// ordered out by its app (hidden); a window whose only Spaces are inactive
-/// returns `Some(false)` here and must be treated as alive.
+/// ordered out by its app (hidden). `Some(false)` alone cannot distinguish
+/// inactive-Space windows from unassigned surfaces; use `on_any_space` for that.
 pub fn on_current_space(window_id: u32) -> Option<bool> {
+    has_space(window_id, SPACE_MASK_CURRENT)
+}
+
+/// Distinguishes unassigned helper surfaces from windows on inactive Spaces.
+/// A failed query is unknown, never evidence that a window is unassigned.
+pub fn on_any_space(window_id: u32) -> Option<bool> {
+    has_space(window_id, SPACE_MASK_ALL)
+}
+
+fn has_space(window_id: u32, mask: i32) -> Option<bool> {
     let sky = skylight()?;
     let ids = CFArray::from_retained_objects(&[CFNumber::new_i64(i64::from(window_id))]);
     let spaces = unsafe {
         (sky.copy_spaces_for_windows)(
             sky.connection,
-            SPACE_MASK_CURRENT,
+            mask,
             CFRetained::as_ptr(&ids).as_ptr().cast(),
         )
     };

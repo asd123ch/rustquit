@@ -1,3 +1,12 @@
 /target
 /dist
+/.release-backups
 .DS_Store
+
+# Local release operations and credentials must never be published.
+/docs/RELEASING.md
+notarization.env
+.env
+.env.*
+*.p8
+*.key

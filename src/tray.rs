@@ -18,12 +18,14 @@ use crate::config::ConfigHandle;
 use crate::engine::recent::{RecentQuitsHandle, age_label};
 use crate::keepalive::KeepAlive;
 use crate::settings_window::SettingsController;
+use crate::update_monitor::UpdateMonitor;
 
 pub struct TrayIvars {
     config: ConfigHandle,
     settings: Retained<SettingsController>,
     recent_quits: RecentQuitsHandle,
     keep_alive: Rc<KeepAlive>,
+    updates: Rc<UpdateMonitor>,
     enabled_item: RefCell<Option<Retained<NSMenuItem>>>,
     keep_alive_item: RefCell<Option<Retained<NSMenuItem>>>,
     status_button: RefCell<Option<Retained<NSStatusBarButton>>>,
@@ -31,6 +33,7 @@ pub struct TrayIvars {
     permission_item: RefCell<Option<Retained<NSMenuItem>>>,
     permission_menu: RefCell<Option<Retained<NSMenu>>>,
     permission_separator: RefCell<Option<Retained<NSMenuItem>>>,
+    update_item: RefCell<Option<Retained<NSMenuItem>>>,
 }
 
 define_class!(
@@ -88,6 +91,11 @@ define_class!(
         #[unsafe(method(onOpenSettings:))]
         fn on_open_settings(&self, _sender: Option<&AnyObject>) {
             self.ivars().settings.show();
+        }
+
+        #[unsafe(method(onOpenUpdate:))]
+        fn on_open_update(&self, _sender: Option<&AnyObject>) {
+            self.ivars().updates.open_available_release();
         }
 
         #[unsafe(method(onOpenAccessibilitySettings:))]
@@ -157,12 +165,14 @@ impl TrayTarget {
         settings: Retained<SettingsController>,
         recent_quits: RecentQuitsHandle,
         keep_alive: Rc<KeepAlive>,
+        updates: Rc<UpdateMonitor>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(TrayIvars {
             config,
             settings,
             recent_quits,
             keep_alive,
+            updates,
             enabled_item: RefCell::new(None),
             keep_alive_item: RefCell::new(None),
             status_button: RefCell::new(None),
@@ -170,6 +180,7 @@ impl TrayTarget {
             permission_item: RefCell::new(None),
             permission_menu: RefCell::new(None),
             permission_separator: RefCell::new(None),
+            update_item: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -194,6 +205,13 @@ impl TrayTarget {
         }
         if let Some(item) = ivars.keep_alive_item.borrow().as_ref() {
             item.setState(state(keep_alive));
+        }
+        if let Some(item) = ivars.update_item.borrow().as_ref() {
+            let title = ivars.updates.menu_title();
+            item.setHidden(title.is_none());
+            if let Some(title) = title {
+                item.setTitle(&NSString::from_str(&title));
+            }
         }
         // Dim the menu bar icon while auto-quit is off.
         if let Some(button) = ivars.status_button.borrow().as_ref() {
@@ -340,8 +358,9 @@ impl Tray {
         settings: Retained<SettingsController>,
         recent_quits: RecentQuitsHandle,
         keep_alive: Rc<KeepAlive>,
+        updates: Rc<UpdateMonitor>,
     ) -> Tray {
-        let target = TrayTarget::new(mtm, config, settings, recent_quits, keep_alive);
+        let target = TrayTarget::new(mtm, config, settings, recent_quits, keep_alive, updates);
 
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
@@ -437,6 +456,21 @@ impl Tray {
         recent_item.setSubmenu(Some(&recent_menu));
         menu.addItem(&recent_item);
         target.ivars().recent_menu.replace(Some(recent_menu));
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        let update_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                ns_string!(""),
+                Some(sel!(onOpenUpdate:)),
+                ns_string!(""),
+            )
+        };
+        unsafe { update_item.setTarget(Some(target_obj)) };
+        update_item.setHidden(true);
+        menu.addItem(&update_item);
+        target.ivars().update_item.replace(Some(update_item));
 
         let settings_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

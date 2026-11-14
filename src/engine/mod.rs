@@ -59,14 +59,14 @@ fn is_close_to_background(bundle_id: Option<&str>) -> bool {
 #[derive(Clone, Copy, Debug)]
 enum RecountPhase {
     WindowDestroyed,
-    AppDeactivated,
+    WindowStateChanged,
     FinalCheck(QuitEvidence),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum QuitEvidence {
     WindowDestroyed,
-    AppDeactivated,
+    WindowStateChanged,
     /// The app hid after deactivation and two AX recounts found no standard
     /// windows. This is stronger than deactivation alone: stale CG surfaces
     /// without an onscreen flag may be ignored, while visible and confirmed
@@ -176,13 +176,13 @@ impl Engine {
                                 QuitEvidence::WindowDestroyed | QuitEvidence::HiddenWindowless => {
                                     counter::CgWindowPolicy::Confirmed
                                 }
-                                QuitEvidence::AppDeactivated => {
+                                QuitEvidence::WindowStateChanged => {
                                     counter::CgWindowPolicy::Conservative
                                 }
                             };
                             counter::cg_window_count(request.pid, policy)
                         }
-                        RecountPhase::WindowDestroyed | RecountPhase::AppDeactivated => None,
+                        RecountPhase::WindowDestroyed | RecountPhase::WindowStateChanged => None,
                     };
                     if worker_tx
                         .send(RecountResult {
@@ -275,10 +275,10 @@ impl Engine {
                     let block = block2::RcBlock::new(
                         move |_timer: std::ptr::NonNull<objc2_foundation::NSTimer>| {
                             catch_callback_panic("watcher retry timer", || {
-                                if let Some(engine) = engine.upgrade() {
-                                    if !app.isTerminated() {
-                                        engine.add_watcher_inner(app.clone(), false);
-                                    }
+                                if let Some(engine) = engine.upgrade()
+                                    && !app.isTerminated()
+                                {
+                                    engine.add_watcher_inner(app.clone(), false);
                                 }
                             });
                         },
@@ -342,18 +342,17 @@ impl Engine {
         if self.watchers.borrow_mut().remove(&pid).is_some() {
             tracing::debug!(pid, "app terminated, watcher removed");
         }
-        if let Some(pending) = self.pending_terminations.borrow_mut().remove(&pid) {
-            if pending.requested_at.elapsed().as_secs_f64() <= PENDING_TERMINATION_TIMEOUT_SECS {
-                self.recent_quits
-                    .push_auto_quit(pending.bundle_id, pending.name);
-            }
+        if let Some(pending) = self.pending_terminations.borrow_mut().remove(&pid)
+            && pending.requested_at.elapsed().as_secs_f64() <= PENDING_TERMINATION_TIMEOUT_SECS
+        {
+            self.recent_quits
+                .push_auto_quit(pending.bundle_id, pending.name);
         }
     }
 
-    /// Rescue path for apps whose AX destroy events never arrive
-    /// (Firefox, iTerm2, some Electron apps): when the user switches away
-    /// from an app, recount its windows and quit it if none are left.
-    pub(crate) fn on_app_deactivated(self: &Rc<Self>, pid: libc::pid_t) {
+    /// Weak fallback trigger for apps without reliable AX destroy events.
+    /// Focus changes and deactivation still require two fresh window counts.
+    pub(crate) fn on_window_state_changed(self: &Rc<Self>, pid: libc::pid_t) {
         let watchers = self.watchers.borrow();
         let Some(watcher) = watchers.get(&pid) else {
             return;
@@ -361,7 +360,11 @@ impl Engine {
         if !watcher.had_window.get() || !self.should_quit(watcher) {
             return;
         }
-        self.request_recount(pid, watcher.generation.get(), RecountPhase::AppDeactivated);
+        self.request_recount(
+            pid,
+            watcher.generation.get(),
+            RecountPhase::WindowStateChanged,
+        );
     }
 
     pub(crate) fn on_space_changed(&self) {
@@ -409,6 +412,10 @@ impl Engine {
                 watcher.forget_window(element);
                 let generation = self.bump_generation(watcher);
                 self.request_recount(pid, generation, RecountPhase::WindowDestroyed);
+            }
+            ax::NOTIF_MAIN_WINDOW_CHANGED | ax::NOTIF_FOCUSED_WINDOW_CHANGED => {
+                drop(watchers);
+                self.on_window_state_changed(pid);
             }
             _ => {}
         }
@@ -561,17 +568,17 @@ impl Engine {
         }
 
         match request.phase {
-            RecountPhase::WindowDestroyed | RecountPhase::AppDeactivated => {
+            RecountPhase::WindowDestroyed | RecountPhase::WindowStateChanged => {
                 if !watcher.had_window.get() || !self.should_quit(watcher) {
                     return;
                 }
                 let delay = self.config.data.borrow().quit_delay_secs.max(0.05);
                 let evidence = match request.phase {
                     RecountPhase::WindowDestroyed => QuitEvidence::WindowDestroyed,
-                    RecountPhase::AppDeactivated if watcher.app.isHidden() => {
+                    RecountPhase::WindowStateChanged if watcher.app.isHidden() => {
                         QuitEvidence::HiddenWindowless
                     }
-                    RecountPhase::AppDeactivated => QuitEvidence::AppDeactivated,
+                    RecountPhase::WindowStateChanged => QuitEvidence::WindowStateChanged,
                     RecountPhase::FinalCheck(_) => unreachable!(),
                 };
                 quitter::schedule(

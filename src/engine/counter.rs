@@ -110,12 +110,10 @@ fn onscreen_window_ids(pid: libc::pid_t) -> Option<HashSet<u32>> {
             && dict_i64(dict, unsafe { kCGWindowLayer }) == Some(0)
             && dict_bool(dict, unsafe { kCGWindowIsOnscreen }).is_some_and(|value| value)
             && dict_f64(dict, unsafe { kCGWindowAlpha }).is_some_and(|a| a > 0.0)
+            && let Some(number) = dict_i64(dict, unsafe { kCGWindowNumber })
+            && let Ok(number) = u32::try_from(number)
         {
-            if let Some(number) = dict_i64(dict, unsafe { kCGWindowNumber }) {
-                if let Ok(number) = u32::try_from(number) {
-                    ids.insert(number);
-                }
-            }
+            ids.insert(number);
         }
     }
     Some(ids)
@@ -147,10 +145,16 @@ pub fn cg_window_count(pid: libc::pid_t, policy: CgWindowPolicy) -> Option<usize
             continue;
         }
         let onscreen = dict_bool(dict, unsafe { kCGWindowIsOnscreen });
-        let on_current_space = dict_i64(dict, unsafe { kCGWindowNumber })
+        let window_id = dict_i64(dict, unsafe { kCGWindowNumber })
             .and_then(|number| u32::try_from(number).ok())
-            .and_then(spaces::on_current_space);
-        if cg_window_vetoes_quit(onscreen, on_current_space, policy) {
+            .filter(|number| *number != 0);
+        let on_current_space = window_id.and_then(spaces::on_current_space);
+        let on_any_space = if onscreen != Some(true) && on_current_space == Some(false) {
+            window_id.and_then(spaces::on_any_space)
+        } else {
+            None
+        };
+        if cg_window_vetoes_quit(onscreen, on_current_space, on_any_space, policy) {
             count += 1;
         }
     }
@@ -163,8 +167,14 @@ pub fn cg_window_count(pid: libc::pid_t, policy: CgWindowPolicy) -> Option<usize
 fn cg_window_vetoes_quit(
     onscreen: Option<bool>,
     on_current_space: Option<bool>,
+    on_any_space: Option<bool>,
     policy: CgWindowPolicy,
 ) -> bool {
+    // A successful empty all-Spaces query identifies an unassigned surface,
+    // not a user window on another Desktop. Visible or conflicting data wins.
+    if onscreen != Some(true) && on_current_space == Some(false) && on_any_space == Some(false) {
+        return false;
+    }
     match policy {
         CgWindowPolicy::Conservative => {
             !matches!((onscreen, on_current_space), (Some(false), Some(true)))
@@ -207,11 +217,58 @@ mod tests {
     use super::{CgWindowPolicy, cg_window_vetoes_quit};
 
     fn conservative(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
-        cg_window_vetoes_quit(onscreen, on_current_space, CgWindowPolicy::Conservative)
+        cg_window_vetoes_quit(
+            onscreen,
+            on_current_space,
+            None,
+            CgWindowPolicy::Conservative,
+        )
     }
 
     fn confirmed(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
-        cg_window_vetoes_quit(onscreen, on_current_space, CgWindowPolicy::Confirmed)
+        cg_window_vetoes_quit(onscreen, on_current_space, None, CgWindowPolicy::Confirmed)
+    }
+
+    #[test]
+    fn unassigned_offscreen_surfaces_do_not_veto_windowless_apps() {
+        for onscreen in [None, Some(false)] {
+            assert!(!cg_window_vetoes_quit(
+                onscreen,
+                Some(false),
+                Some(false),
+                CgWindowPolicy::Conservative,
+            ));
+        }
+    }
+
+    #[test]
+    fn assigned_or_uncertain_surfaces_still_veto() {
+        assert!(cg_window_vetoes_quit(
+            None,
+            None,
+            Some(false),
+            CgWindowPolicy::Conservative,
+        ));
+        for assigned in [Some(true), None] {
+            assert!(cg_window_vetoes_quit(
+                None,
+                Some(false),
+                assigned,
+                CgWindowPolicy::Conservative,
+            ));
+        }
+        assert!(cg_window_vetoes_quit(
+            Some(true),
+            Some(false),
+            Some(false),
+            CgWindowPolicy::Conservative,
+        ));
+        assert!(cg_window_vetoes_quit(
+            None,
+            Some(true),
+            Some(false),
+            CgWindowPolicy::Conservative,
+        ));
     }
 
     #[test]

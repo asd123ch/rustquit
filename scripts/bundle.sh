@@ -9,14 +9,14 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-cargo build --release --locked
+cargo build --release --locked --target aarch64-apple-darwin
 
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 APP=dist/RustQuit.app
 rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/rustquit "$APP/Contents/MacOS/rustquit"
+cp target/aarch64-apple-darwin/release/rustquit "$APP/Contents/MacOS/rustquit"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 cp LICENSE "$APP/Contents/Resources/LICENSE"
 cp assets/RustQuit.icns "$APP/Contents/Resources/RustQuit.icns"

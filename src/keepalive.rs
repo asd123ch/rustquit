@@ -1,5 +1,5 @@
 //! Keep-alive: relaunches selected apps when they terminate, while treating
-//! related external background helpers as satisfying Keep.
+//! related menu bar helpers as satisfying Keep.
 //!
 //! Terminations are detected by observing `NSWorkspace.runningApplications`
 //! via key-value observing and diffing against the last snapshot. The
@@ -18,7 +18,7 @@
 //! actively trying to get rid of, stops being resurrected.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -145,11 +145,7 @@ impl RunningAppsObserver {
         let current = snapshot_running_apps();
         let (terminated, appeared) = {
             let known = self.ivars().known.borrow();
-            let terminated: Vec<(libc::pid_t, KnownApp)> = known
-                .iter()
-                .filter(|(pid, _)| !current.contains_key(pid))
-                .map(|(pid, app)| (*pid, app.clone()))
-                .collect();
+            let terminated = terminated_apps(&known, &current);
             let appeared: Vec<(libc::pid_t, String)> = current
                 .iter()
                 .filter(|(pid, _)| !known.contains_key(pid))
@@ -167,6 +163,24 @@ impl RunningAppsObserver {
             }
         }
     }
+}
+
+fn terminated_apps(
+    known: &HashMap<libc::pid_t, KnownApp>,
+    current: &HashMap<libc::pid_t, KnownApp>,
+) -> Vec<(libc::pid_t, KnownApp)> {
+    let running_bundles: HashSet<String> = current
+        .values()
+        .map(|app| app.bundle_id.to_ascii_lowercase())
+        .collect();
+    known
+        .iter()
+        .filter(|(pid, app)| {
+            !current.contains_key(pid)
+                && !running_bundles.contains(&app.bundle_id.to_ascii_lowercase())
+        })
+        .map(|(pid, app)| (*pid, app.clone()))
+        .collect()
 }
 
 fn snapshot_running_apps() -> HashMap<libc::pid_t, KnownApp> {
@@ -269,10 +283,8 @@ impl KeepAlive {
     /// eventual exit status (crash vs. deliberate quit) is captured.
     fn watch_if_listed(&self, pid: libc::pid_t, bundle_id: &str) {
         let listed = is_listed(&self.config.data.borrow().keep_alive_apps, bundle_id);
-        if listed {
-            if let Some(proc_exit) = &self.proc_exit {
-                proc_exit.watch(pid);
-            }
+        if listed && let Some(proc_exit) = &self.proc_exit {
+            proc_exit.watch(pid);
         }
     }
 
@@ -422,10 +434,8 @@ impl KeepAlive {
     /// Launches the app hidden unless it is already running. Returns
     /// whether a launch was requested.
     ///
-    /// Hidden is the whole trick for close-to-background suites: the
-    /// process comes back (menu bar icons are unaffected by the hidden
-    /// state), but no settings or main window pops up. A regular app
-    /// relaunched this way sits in the Dock; one click shows its window.
+    /// Running menu bar helpers suppress a frontend launch altogether.
+    /// Hiding a launch alone cannot prevent an app from showing its UI.
     fn launch_if_needed(&self, bundle_id: &str) -> bool {
         {
             let config = self.config.data.borrow();
@@ -613,12 +623,11 @@ fn background_suite_running(target_bundle_id: &str, target_path: &str) -> bool {
         .and_then(|name| name.to_str())
         .map(normalized_app_name)
         .filter(|name| name.len() >= 6);
-    let target_path = Path::new(target_path);
 
     NSWorkspace::sharedWorkspace()
         .runningApplications()
         .iter()
-        .filter(|app| app.activationPolicy() != NSApplicationActivationPolicy::Regular)
+        .filter(|app| !app.isTerminated())
         .any(|app| {
             let Some(helper_path) = app
                 .bundleURL()
@@ -626,31 +635,48 @@ fn background_suite_running(target_bundle_id: &str, target_path: &str) -> bool {
             else {
                 return false;
             };
-            let helper_path = Path::new(&helper_path);
-            if helper_path.starts_with(target_path) {
-                return false;
-            }
-
-            let related_bundle = app.bundleIdentifier().is_some_and(|bundle_id| {
-                bundle_id
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .starts_with(&bundle_prefix)
-            });
-            if related_bundle {
-                return true;
-            }
-
-            let Some(target_name) = target_name.as_ref() else {
-                return false;
-            };
-            helper_path.components().any(|component| {
-                component
-                    .as_os_str()
-                    .to_str()
-                    .is_some_and(|name| normalized_app_name(name).starts_with(target_name))
-            })
+            related_background_app(
+                &bundle_prefix,
+                target_name.as_deref(),
+                Path::new(target_path),
+                app.bundleIdentifier()
+                    .as_ref()
+                    .map(|id| id.to_string())
+                    .as_deref(),
+                Path::new(&helper_path),
+                app.activationPolicy(),
+            )
         })
+}
+
+fn related_background_app(
+    bundle_prefix: &str,
+    target_name: Option<&str>,
+    target_path: &Path,
+    helper_bundle_id: Option<&str>,
+    helper_path: &Path,
+    policy: NSApplicationActivationPolicy,
+) -> bool {
+    if policy == NSApplicationActivationPolicy::Regular || helper_path == target_path {
+        return false;
+    }
+    if helper_path.starts_with(target_path) {
+        // Embedded accessory apps can own persistent menu bar UI. Prohibited
+        // worker processes may outlive a crashed frontend and must not veto it.
+        return policy == NSApplicationActivationPolicy::Accessory;
+    }
+    if helper_bundle_id.is_some_and(|id| id.to_ascii_lowercase().starts_with(bundle_prefix)) {
+        return true;
+    }
+    let Some(target_name) = target_name else {
+        return false;
+    };
+    helper_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| normalized_app_name(name).starts_with(target_name))
+    })
 }
 
 fn normalized_app_name(name: &str) -> String {
@@ -658,4 +684,94 @@ fn normalized_app_name(name: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric())
         .map(|character| character.to_ascii_lowercase())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KnownApp, related_background_app, terminated_apps};
+    use objc2_app_kit::NSApplicationActivationPolicy as Policy;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    #[test]
+    fn embedded_menu_bar_app_keeps_settings_frontend_closed() {
+        assert!(related_background_app(
+            "com.example.monitor.",
+            Some("monitor"),
+            Path::new("/Applications/Monitor.app"),
+            Some("com.example.monitor.status"),
+            Path::new("/Applications/Monitor.app/Contents/Resources/Menu Bar.app"),
+            Policy::Accessory,
+        ));
+    }
+
+    #[test]
+    fn embedded_background_worker_does_not_block_relaunch() {
+        assert!(!related_background_app(
+            "com.example.monitor.",
+            Some("monitor"),
+            Path::new("/Applications/Monitor.app"),
+            Some("com.example.monitor.worker"),
+            Path::new("/Applications/Monitor.app/Contents/Frameworks/Worker.app"),
+            Policy::Prohibited,
+        ));
+    }
+
+    #[test]
+    fn external_related_helper_still_keeps_frontend_closed() {
+        assert!(related_background_app(
+            "com.example.monitor.",
+            Some("monitor"),
+            Path::new("/Applications/Monitor.app"),
+            Some("com.example.monitor.status"),
+            Path::new("/Library/Application Support/Monitor/Menu Bar.app"),
+            Policy::Accessory,
+        ));
+    }
+
+    #[test]
+    fn unrelated_apps_and_regular_frontends_do_not_satisfy_keep() {
+        for (id, path, policy) in [
+            (
+                "com.example.other",
+                "/Applications/Other.app",
+                Policy::Accessory,
+            ),
+            (
+                "com.example.monitor.settings",
+                "/Applications/Settings.app",
+                Policy::Regular,
+            ),
+            (
+                "com.example.monitor",
+                "/Applications/Monitor.app",
+                Policy::Accessory,
+            ),
+        ] {
+            assert!(!related_background_app(
+                "com.example.monitor.",
+                Some("monitor"),
+                Path::new("/Applications/Monitor.app"),
+                Some(id),
+                Path::new(path),
+                policy,
+            ));
+        }
+    }
+
+    #[test]
+    fn one_process_exiting_does_not_terminate_a_still_running_bundle() {
+        let main = KnownApp {
+            bundle_id: "com.example.drive".into(),
+            name: "Drive".into(),
+            menu_bar: true,
+        };
+        let transient = main.clone();
+        let known = HashMap::from([(100, main.clone()), (101, transient)]);
+        let current = HashMap::from([(100, main)]);
+
+        let terminated = terminated_apps(&known, &current);
+
+        assert!(terminated.is_empty());
+    }
 }

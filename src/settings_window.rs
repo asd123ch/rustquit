@@ -21,6 +21,7 @@ use objc2_foundation::{
 
 use crate::config::{ConfigHandle, FilterMode};
 use crate::engine;
+use crate::update_monitor::UpdateMonitor;
 
 const DELAY_CHOICES: &[(f64, &str)] = &[
     (0.05, "0.05 seconds"),
@@ -59,6 +60,7 @@ struct AppEntry {
 
 pub struct SettingsIvars {
     config: ConfigHandle,
+    updates: std::rc::Rc<UpdateMonitor>,
     entries: RefCell<Vec<AppEntry>>,
     all_entries: RefCell<Vec<AppEntry>>,
     search_field: RefCell<Option<Retained<objc2_app_kit::NSSearchField>>>,
@@ -75,6 +77,7 @@ pub struct SettingsIvars {
     blacklist_radio: RefCell<Option<Retained<NSButton>>>,
     delay_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     autostart_checkbox: RefCell<Option<Retained<NSButton>>>,
+    updates_checkbox: RefCell<Option<Retained<NSButton>>>,
     enabled_checkbox: RefCell<Option<Retained<NSButton>>>,
     keep_alive_checkbox: RefCell<Option<Retained<NSButton>>>,
     auto_start_missing_checkbox: RefCell<Option<Retained<NSButton>>>,
@@ -224,10 +227,10 @@ define_class!(
                 .update(|config| config.keep_alive_auto_start_missing = wanted)
             {
                 Ok(()) => {
-                    if wanted {
-                        if let Some(keep_alive) = self.ivars().keep_alive.borrow().as_ref() {
-                            keep_alive.reconcile_missing_apps();
-                        }
+                    if wanted
+                        && let Some(keep_alive) = self.ivars().keep_alive.borrow().as_ref()
+                    {
+                        keep_alive.reconcile_missing_apps();
                     }
                 }
                 Err(err) => {
@@ -255,15 +258,14 @@ define_class!(
         fn on_restart_delay_changed(&self, sender: Option<&NSPopUpButton>) {
             let Some(sender) = sender else { return };
             let index = sender.indexOfSelectedItem();
-            if let Some((secs, _)) = RESTART_DELAY_CHOICES.get(index as usize) {
-                if let Err(err) = self
+            if let Some((secs, _)) = RESTART_DELAY_CHOICES.get(index as usize)
+                && let Err(err) = self
                     .ivars()
                     .config
                     .update(|config| config.keep_alive_delay_secs = *secs)
-                {
-                    tracing::error!(%err, "cannot persist restart delay");
-                    self.sync_controls();
-                }
+            {
+                tracing::error!(%err, "cannot persist restart delay");
+                self.sync_controls();
             }
         }
 
@@ -287,15 +289,14 @@ define_class!(
         fn on_delay_changed(&self, sender: Option<&NSPopUpButton>) {
             let Some(sender) = sender else { return };
             let index = sender.indexOfSelectedItem();
-            if let Some((secs, _)) = DELAY_CHOICES.get(index as usize) {
-                if let Err(err) = self
+            if let Some((secs, _)) = DELAY_CHOICES.get(index as usize)
+                && let Err(err) = self
                     .ivars()
                     .config
                     .update(|config| config.quit_delay_secs = *secs)
-                {
-                    tracing::error!(%err, "cannot persist quit delay");
-                    self.sync_controls();
-                }
+            {
+                tracing::error!(%err, "cannot persist quit delay");
+                self.sync_controls();
             }
         }
 
@@ -335,13 +336,33 @@ define_class!(
                 NSWorkspace::sharedWorkspace().openURL(&url);
             }
         }
+
+        #[unsafe(method(onCheckForUpdates:))]
+        fn on_check_for_updates(&self, _sender: Option<&AnyObject>) {
+            self.ivars().updates.check_now(true);
+        }
+
+        #[unsafe(method(onAutomaticUpdatesChanged:))]
+        fn on_automatic_updates_changed(&self, sender: Option<&NSButton>) {
+            let Some(sender) = sender else { return };
+            let enabled = sender.state() == NSControlStateValueOn;
+            if let Err(err) = self.ivars().config.update(|config| config.check_for_updates = enabled) {
+                tracing::error!(%err, "cannot persist update preference");
+                self.sync_controls();
+            }
+        }
     }
 );
 
 impl SettingsController {
-    pub fn new(mtm: MainThreadMarker, config: ConfigHandle) -> Retained<Self> {
+    pub fn new(
+        mtm: MainThreadMarker,
+        config: ConfigHandle,
+        updates: std::rc::Rc<UpdateMonitor>,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(SettingsIvars {
             config,
+            updates,
             entries: RefCell::new(Vec::new()),
             all_entries: RefCell::new(Vec::new()),
             search_field: RefCell::new(None),
@@ -356,6 +377,7 @@ impl SettingsController {
             blacklist_radio: RefCell::new(None),
             delay_popup: RefCell::new(None),
             autostart_checkbox: RefCell::new(None),
+            updates_checkbox: RefCell::new(None),
             enabled_checkbox: RefCell::new(None),
             keep_alive_checkbox: RefCell::new(None),
             auto_start_missing_checkbox: RefCell::new(None),
@@ -737,6 +759,9 @@ impl SettingsController {
         if let Some(checkbox) = ivars.enabled_checkbox.borrow().as_ref() {
             checkbox.setState(if config.enabled { on } else { off });
         }
+        if let Some(checkbox) = ivars.updates_checkbox.borrow().as_ref() {
+            checkbox.setState(if config.check_for_updates { on } else { off });
+        }
         if let Some(checkbox) = ivars.keep_alive_checkbox.borrow().as_ref() {
             checkbox.setState(if config.keep_alive_enabled { on } else { off });
         }
@@ -784,10 +809,10 @@ impl SettingsController {
         }
         // setTitle alone does not redraw the header until some other event
         // does; force it so the mode switch is reflected immediately.
-        if let Some(table) = ivars.table.borrow().as_ref() {
-            if let Some(header) = table.headerView() {
-                header.setNeedsDisplay(true);
-            }
+        if let Some(table) = ivars.table.borrow().as_ref()
+            && let Some(header) = table.headerView()
+        {
+            header.setNeedsDisplay(true);
         }
         if let Some(label) = ivars.apps_hint.borrow().as_ref() {
             label.setStringValue(&NSString::from_str(hint));
@@ -844,8 +869,14 @@ impl SettingsController {
         stack.addArrangedSubview(&bold_label("General", mtm));
         let autostart = checkbox("Launch at login", sel!(onAutostartChanged:));
         stack.addArrangedSubview(&autostart);
-        end_section(&autostart);
         self.ivars().autostart_checkbox.replace(Some(autostart));
+        let updates = checkbox(
+            "Automatically check for updates",
+            sel!(onAutomaticUpdatesChanged:),
+        );
+        stack.addArrangedSubview(&updates);
+        end_section(&updates);
+        self.ivars().updates_checkbox.replace(Some(updates));
 
         // — Auto-Quit —
         stack.addArrangedSubview(&bold_label("Auto-Quit", mtm));
@@ -984,10 +1015,21 @@ impl SettingsController {
         };
         stack.addArrangedSubview(&add_button);
 
-        // Footer: version and project link.
         let footer = NSStackView::new(mtm);
         footer.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
         footer.setSpacing(6.0);
+        let update_button = unsafe {
+            NSButton::buttonWithTitle_target_action(
+                ns_string!("Check for Updates…"),
+                Some(self_obj),
+                Some(sel!(onCheckForUpdates:)),
+                mtm,
+            )
+        };
+        update_button.setBordered(false);
+        update_button.setFont(Some(&objc2_app_kit::NSFont::systemFontOfSize(11.0)));
+        update_button.setContentTintColor(Some(&objc2_app_kit::NSColor::linkColor()));
+        footer.addArrangedSubview(&update_button);
         let version_label = NSTextField::labelWithString(
             &NSString::from_str(&format!("RustQuit v{}", env!("CARGO_PKG_VERSION"))),
             mtm,
@@ -1071,10 +1113,10 @@ fn scan_standard_apps() -> Vec<AppEntry> {
         let mut paths = Vec::new();
         collect_app_paths(&dir, 2, &mut paths);
         for path in paths {
-            if let Some(entry) = app_entry_from_path(&path) {
-                if seen.insert(entry.bundle_id.to_ascii_lowercase()) {
-                    entries.push(entry);
-                }
+            if let Some(entry) = app_entry_from_path(&path)
+                && seen.insert(entry.bundle_id.to_ascii_lowercase())
+            {
+                entries.push(entry);
             }
         }
     }

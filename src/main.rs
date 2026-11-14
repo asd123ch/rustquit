@@ -5,11 +5,13 @@ mod config;
 mod engine;
 mod instance;
 mod keepalive;
+mod network;
 mod permissions;
 mod procexit;
 mod protected;
 mod settings_window;
 mod tray;
+mod update_monitor;
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -41,7 +43,8 @@ fn main() {
     };
 
     let config = config::ConfigStore::load();
-    let settings = settings_window::SettingsController::new(mtm, config.clone());
+    let updates = update_monitor::UpdateMonitor::start(config.clone());
+    let settings = settings_window::SettingsController::new(mtm, config.clone(), updates.clone());
     let recent_quits = engine::recent::RecentQuits::new_handle();
 
     // Relaunches keep-alive apps; independent of the engine and its
@@ -55,6 +58,7 @@ fn main() {
         settings.clone(),
         recent_quits.clone(),
         keep_alive.handle(),
+        updates,
     );
     settings.set_tray(tray.target_retained());
     settings.set_keep_alive(keep_alive.handle());
@@ -136,10 +140,10 @@ fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     let log_dir = crate::config::home_dir().map(|home| home.join("Library/Logs/rustquit"));
-    if let Some(dir) = log_dir.as_deref() {
-        if dir.exists() {
-            secure_logs(dir);
-        }
+    if let Some(dir) = log_dir.as_deref()
+        && dir.exists()
+    {
+        secure_logs(dir);
     }
 
     let file_layer = diagnostics

@@ -37,6 +37,7 @@ pub struct Config {
     pub mode: FilterMode,
     pub quit_delay_secs: f64,
     pub enabled: bool,
+    pub check_for_updates: bool,
     /// Bundle IDs; their meaning depends on the mode.
     pub apps: Vec<String>,
     /// Master toggle for relaunching the keep-alive apps.
@@ -67,6 +68,7 @@ impl Default for Config {
             mode: FilterMode::Whitelist,
             quit_delay_secs: 2.0,
             enabled: true,
+            check_for_updates: true,
             apps: Vec::new(),
             keep_alive_enabled: true,
             keep_alive_auto_start_missing: true,
@@ -113,8 +115,8 @@ impl ConfigStore {
                         normalize(&mut config);
                         config
                     }
-                    Err(err) => {
-                        tracing::warn!(%err, "configuration invalid; using safe defaults");
+                    Err(_) => {
+                        tracing::warn!("configuration invalid; using safe defaults");
                         Config::default()
                     }
                 },
@@ -374,6 +376,7 @@ mod tests {
             .update(|config| {
                 config.mode = FilterMode::Blacklist;
                 config.apps.push("com.example.Test".into());
+                config.check_for_updates = false;
             })
             .unwrap();
 
@@ -382,7 +385,49 @@ mod tests {
         let reloaded = ConfigStore::load_from(path);
         assert_eq!(reloaded.data.borrow().mode, FilterMode::Blacklist);
         assert_eq!(reloaded.data.borrow().apps, vec!["com.example.Test"]);
+        assert!(!reloaded.data.borrow().check_for_updates);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_config_does_not_log_input() {
+        let path = temp_config_path("invalid-private");
+        let root = path.parent().unwrap();
+        std::fs::create_dir_all(root).unwrap();
+        let log_path = root.join("diagnostic.log");
+
+        for input in [
+            "apps = [\"synthetic-private-marker\"\n",
+            "mode = \"synthetic-private-marker\"\n",
+        ] {
+            std::fs::write(&path, input).unwrap();
+            let log = File::create(&log_path).unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || log.try_clone().unwrap())
+                .finish();
+            let store = tracing::subscriber::with_default(subscriber, || {
+                ConfigStore::load_from(path.clone())
+            });
+
+            assert_eq!(*store.data.borrow(), Config::default());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), input);
+            let output = std::fs::read_to_string(&log_path).unwrap();
+            assert!(output.contains("configuration invalid; using safe defaults"));
+            assert!(!output.contains("synthetic-private-marker"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn existing_configs_keep_their_app_lists() {
+        let config: Config =
+            toml::from_str("apps = ['com.example.Quit']\nkeep_alive_apps = ['com.example.Keep']\n")
+                .unwrap();
+        assert!(config.check_for_updates);
+        assert_eq!(config.apps, ["com.example.Quit"]);
+        assert_eq!(config.keep_alive_apps, ["com.example.Keep"]);
     }
 
     #[test]

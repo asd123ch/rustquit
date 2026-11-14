@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a focused improvement to RustQuit
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem should RustQuit solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: Describe the expected user-visible behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Security and privacy impact
+      description: Note any new permissions, stored data or network access.

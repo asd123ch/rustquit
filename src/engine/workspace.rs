@@ -67,7 +67,7 @@ pub fn subscribe(engine: &Rc<Engine>) -> Vec<ObserverToken> {
                 return;
             };
             if let Some(app) = running_app_from(unsafe { notification.as_ref() }) {
-                engine.on_app_deactivated(app.processIdentifier());
+                engine.on_window_state_changed(app.processIdentifier());
             }
         });
     });

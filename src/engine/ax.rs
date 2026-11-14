@@ -17,6 +17,8 @@ use objc2_core_foundation::{
 // API.
 pub const NOTIF_WINDOW_CREATED: &str = "AXWindowCreated";
 pub const NOTIF_ELEMENT_DESTROYED: &str = "AXUIElementDestroyed";
+pub const NOTIF_MAIN_WINDOW_CHANGED: &str = "AXMainWindowChanged";
+pub const NOTIF_FOCUSED_WINDOW_CHANGED: &str = "AXFocusedWindowChanged";
 pub const ATTR_WINDOWS: &str = "AXWindows";
 pub const ATTR_SUBROLE: &str = "AXSubrole";
 pub const ATTR_MINIMIZED: &str = "AXMinimized";

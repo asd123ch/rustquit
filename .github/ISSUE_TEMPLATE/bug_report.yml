@@ -1,0 +1,52 @@
+name: Bug report
+description: Report reproducible incorrect RustQuit behaviour
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials or personal data. Report security vulnerabilities through the private link below.
+  - type: input
+    id: version
+    attributes:
+      label: RustQuit version
+      placeholder: 0.4.5
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: 15.6
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Close ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add redacted logs or screenshots if they help reproduce the issue.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I removed credentials and private data from this report.
+          required: true

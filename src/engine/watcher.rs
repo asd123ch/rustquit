@@ -76,6 +76,21 @@ impl Watcher {
         let refcon = &*context as *const CallbackContext as *mut c_void;
 
         observer.add_notification(&element, ax::NOTIF_WINDOW_CREATED, refcon)?;
+        // Some apps close their last window without a destroy notification
+        // and remain active, so workspace deactivation cannot rescue the close.
+        for notification in [
+            ax::NOTIF_MAIN_WINDOW_CHANGED,
+            ax::NOTIF_FOCUSED_WINDOW_CHANGED,
+        ] {
+            if let Err(err) = observer.add_notification(&element, notification, refcon) {
+                tracing::debug!(
+                    pid,
+                    notification,
+                    ?err,
+                    "window focus notification unavailable"
+                );
+            }
+        }
 
         let watcher = Watcher {
             app,
@@ -159,5 +174,12 @@ impl Drop for Watcher {
         }
         self.observer
             .remove_notification(&self.element, ax::NOTIF_WINDOW_CREATED);
+        for notification in [
+            ax::NOTIF_MAIN_WINDOW_CHANGED,
+            ax::NOTIF_FOCUSED_WINDOW_CHANGED,
+        ] {
+            self.observer
+                .remove_notification(&self.element, notification);
+        }
     }
 }

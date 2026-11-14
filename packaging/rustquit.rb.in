@@ -1,0 +1,29 @@
+cask "rustquit" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "https://github.com/asd123ch/rustquit/releases/download/v#{version}/RustQuit-#{version}.dmg"
+  name "RustQuit"
+  desc "Quit macOS apps after their last window closes"
+  homepage "https://github.com/asd123ch/rustquit"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  depends_on arch: :arm64
+  depends_on macos: :ventura
+
+  app "RustQuit.app"
+
+  uninstall quit: "ch.asd123.rustquit"
+
+  zap trash: [
+    "~/Library/Application Support/ch.asd123.rustquit",
+    "~/Library/Application Support/rustquit",
+    "~/Library/Logs/rustquit",
+    "~/Library/Preferences/ch.asd123.rustquit.plist",
+    "~/Library/Saved Application State/ch.asd123.rustquit.savedState",
+  ]
+end
