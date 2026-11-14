@@ -31,3 +31,4 @@ jobs:
       - run: bash -n scripts/make-signing-identity.sh
       - run: bash -n scripts/package-release.sh
       - run: bash -n scripts/verify-release.sh
+      - run: bash -n scripts/sign-release.sh

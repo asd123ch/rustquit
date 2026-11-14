@@ -57,11 +57,13 @@ if [ "$NOTARIZED" -eq 1 ]; then
   xcrun stapler validate "$DMG"
   spctl --assess --type execute --verbose=2 "$APP"
   spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+  ssh-keygen -Y verify -f packaging/release-signers -I asd123ch -n file \
+    -s "$DMG.sig" < "$DMG"
   SHA256=$(shasum -a 256 "$DMG" | awk '{print $1}')
   sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA256@/$SHA256/g" \
     packaging/rustquit.rb.in > "$temporary/rustquit.rb"
   cmp "$temporary/rustquit.rb" dist/rustquit.rb
-  echo "verify-release: notarized package and matching cask verified"
+  echo "verify-release: notarized package, detached signature and matching cask verified"
 else
   echo "verify-release: local package verified; NOT approved for public distribution"
 fi

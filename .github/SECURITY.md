@@ -50,3 +50,22 @@ diagnostic logs are stored locally with user-only permissions.
 RustQuit requests normal application termination and never force-quits another
 app. It revalidates each termination decision immediately before sending the
 request.
+
+## Verifying downloads
+
+Official DMGs have an Apple Developer ID signature and a stapled notarization
+ticket. macOS checks these when opening the downloaded app.
+
+Releases also include an OpenSSH detached signature, `RustQuit-VERSION.dmg.sig`.
+Download it alongside the DMG. From a trusted checkout of this repository,
+verify both files with:
+
+```sh
+ssh-keygen -Y verify -f packaging/release-signers -I asd123ch -n file \
+  -s /path/to/RustQuit-VERSION.dmg.sig < /path/to/RustQuit-VERSION.dmg
+```
+
+Replace `VERSION` and the paths with the downloaded release. The signer file
+contains only the public release key. Do not substitute an untrusted key when
+verification fails. This signature authenticates the download; it does not
+prove that the binary was reproducibly built from the source.
