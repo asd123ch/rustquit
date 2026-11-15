@@ -1,0 +1,7 @@
+apps = ["com.example.App", "com.EXAMPLE.app", "../invalid", "com.example.Other"]
+keep_alive_apps = ["COM.example.App"]
+keep_alive_launch_at_startup = false
+[keep_alive_ignored_until]
+"com.example.App" = 1800000000
+"COM.example.app" = 1900000000
+"com.example.expired" = 1

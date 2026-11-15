@@ -1,5 +1,8 @@
 /target
 /dist
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
 /.release-backups
 .DS_Store
 

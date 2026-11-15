@@ -17,7 +17,7 @@ use objc2_core_graphics::{
 
 use super::{ax, spaces};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CgWindowPolicy {
     /// Protect every plausible visible or inactive-Space window.
     Conservative,
@@ -48,8 +48,51 @@ pub struct WindowCount {
 /// 3. offscreen, on an inactive Space only  -> counts (visible after switch)
 /// 4. offscreen, yet on a current Space     -> ordered out, does NOT count
 pub fn effective_window_count(pid: libc::pid_t) -> ax::AxResult<WindowCount> {
-    let app_element = ax::application_element(pid);
-    let windows = ax::windows(&app_element)?;
+    count_windows(&NativeWindowQueries(pid))
+}
+
+trait WindowQueries {
+    type Window;
+    fn windows(&self) -> ax::AxResult<Vec<Self::Window>>;
+    fn subrole(&self, window: &Self::Window) -> ax::AxResult<String>;
+    fn minimized(&self, window: &Self::Window) -> bool;
+    fn window_id(&self, window: &Self::Window) -> Option<u32>;
+    fn onscreen_ids(&self) -> Option<HashSet<u32>>;
+    fn on_current_space(&self, id: u32) -> Option<bool>;
+}
+
+struct NativeWindowQueries(libc::pid_t);
+
+impl WindowQueries for NativeWindowQueries {
+    type Window = CFRetained<objc2_application_services::AXUIElement>;
+
+    fn windows(&self) -> ax::AxResult<Vec<Self::Window>> {
+        ax::windows(&ax::application_element(self.0))
+    }
+
+    fn subrole(&self, window: &Self::Window) -> ax::AxResult<String> {
+        ax::subrole(window)
+    }
+
+    fn minimized(&self, window: &Self::Window) -> bool {
+        ax::is_minimized(window)
+    }
+
+    fn window_id(&self, window: &Self::Window) -> Option<u32> {
+        ax::window_id(window)
+    }
+
+    fn onscreen_ids(&self) -> Option<HashSet<u32>> {
+        onscreen_window_ids(self.0)
+    }
+
+    fn on_current_space(&self, id: u32) -> Option<bool> {
+        spaces::on_current_space(id)
+    }
+}
+
+fn count_windows(queries: &impl WindowQueries) -> ax::AxResult<WindowCount> {
+    let windows = queries.windows()?;
     // The CG list is one snapshot for all windows; fetch it lazily so apps
     // whose windows are all minimized never pay for it.
     let mut onscreen_ids: Option<Option<HashSet<u32>>> = None;
@@ -58,22 +101,19 @@ pub fn effective_window_count(pid: libc::pid_t) -> ax::AxResult<WindowCount> {
         ordered_out: 0,
     };
     for window in &windows {
-        if !matches!(
-            ax::subrole(window).as_deref(),
-            Ok(ax::SUBROLE_STANDARD_WINDOW)
-        ) {
+        if queries.subrole(window)? != ax::SUBROLE_STANDARD_WINDOW {
             continue;
         }
-        if ax::is_minimized(window) {
+        if queries.minimized(window) {
             count.effective += 1;
             continue;
         }
-        let Some(window_id) = ax::window_id(window) else {
+        let Some(window_id) = queries.window_id(window) else {
             count.effective += 1;
             continue;
         };
         let onscreen = onscreen_ids
-            .get_or_insert_with(|| onscreen_window_ids(pid))
+            .get_or_insert_with(|| queries.onscreen_ids())
             .as_ref();
         let Some(onscreen) = onscreen else {
             count.effective += 1;
@@ -83,9 +123,9 @@ pub fn effective_window_count(pid: libc::pid_t) -> ax::AxResult<WindowCount> {
             count.effective += 1;
             continue;
         }
-        match spaces::on_current_space(window_id) {
+        match queries.on_current_space(window_id) {
             Some(true) => {
-                tracing::debug!(pid, window_id, "ignoring hidden (ordered-out) window");
+                tracing::debug!(window_id, "ignoring hidden (ordered-out) window");
                 count.ordered_out += 1;
             }
             Some(false) | None => count.effective += 1,
@@ -214,7 +254,221 @@ fn dict_f64(dict: &CFDictionary, key: &objc2_core_foundation::CFString) -> Optio
 
 #[cfg(test)]
 mod tests {
-    use super::{CgWindowPolicy, cg_window_vetoes_quit};
+    use super::*;
+    use objc2_application_services::AXError;
+    use std::cell::Cell;
+
+    #[derive(Clone)]
+    struct Window {
+        subrole: ax::AxResult<String>,
+        minimized: bool,
+        id: Option<u32>,
+    }
+
+    struct Queries {
+        windows: ax::AxResult<Vec<Window>>,
+        onscreen: Option<HashSet<u32>>,
+        current: Option<bool>,
+        cg_calls: Cell<usize>,
+        space_calls: Cell<usize>,
+    }
+
+    impl WindowQueries for Queries {
+        type Window = Window;
+        fn windows(&self) -> ax::AxResult<Vec<Window>> {
+            self.windows.clone()
+        }
+        fn subrole(&self, window: &Window) -> ax::AxResult<String> {
+            window.subrole.clone()
+        }
+        fn minimized(&self, window: &Window) -> bool {
+            window.minimized
+        }
+        fn window_id(&self, window: &Window) -> Option<u32> {
+            window.id
+        }
+        fn onscreen_ids(&self) -> Option<HashSet<u32>> {
+            self.cg_calls.set(self.cg_calls.get() + 1);
+            self.onscreen.clone()
+        }
+        fn on_current_space(&self, _id: u32) -> Option<bool> {
+            self.space_calls.set(self.space_calls.get() + 1);
+            self.current
+        }
+    }
+
+    fn queries() -> Queries {
+        Queries {
+            windows: Ok(vec![Window {
+                subrole: Ok(ax::SUBROLE_STANDARD_WINDOW.into()),
+                minimized: false,
+                id: Some(42),
+            }]),
+            onscreen: Some(HashSet::new()),
+            current: Some(true),
+            cg_calls: Cell::new(0),
+            space_calls: Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn unreadable_subrole_must_not_be_treated_as_no_windows() {
+        let mut q = queries();
+        q.windows.as_mut().unwrap()[0].subrole = Err(AXError::CannotComplete);
+        assert_eq!(count_windows(&q), Err(AXError::CannotComplete));
+        assert_eq!(q.cg_calls.get(), 0);
+    }
+
+    #[test]
+    fn enumeration_errors_propagate_without_consulting_window_server() {
+        for error in [
+            AXError::CannotComplete,
+            AXError::APIDisabled,
+            AXError::InvalidUIElement,
+            AXError::Failure,
+        ] {
+            let mut q = queries();
+            q.windows = Err(error);
+            assert_eq!(count_windows(&q), Err(error));
+            assert_eq!(q.cg_calls.get(), 0);
+        }
+    }
+
+    #[test]
+    fn empty_and_nonstandard_windows_do_not_trigger_visibility_queries() {
+        let mut q = queries();
+        q.windows = Ok(Vec::new());
+        assert_eq!(
+            count_windows(&q).unwrap(),
+            WindowCount {
+                effective: 0,
+                ordered_out: 0
+            }
+        );
+        q.windows = Ok(vec![Window {
+            subrole: Ok("AXDialog".into()),
+            minimized: false,
+            id: Some(42),
+        }]);
+        assert_eq!(count_windows(&q).unwrap().effective, 0);
+        assert_eq!(q.cg_calls.get(), 0);
+    }
+
+    #[test]
+    fn minimized_windows_remain_open_without_cg_or_spaces_queries() {
+        let mut q = queries();
+        q.windows.as_mut().unwrap()[0].minimized = true;
+        assert_eq!(
+            count_windows(&q).unwrap(),
+            WindowCount {
+                effective: 1,
+                ordered_out: 0
+            }
+        );
+        assert_eq!(q.cg_calls.get(), 0);
+        assert_eq!(q.space_calls.get(), 0);
+    }
+
+    #[test]
+    fn missing_window_id_or_cg_snapshot_keeps_windows_alive() {
+        let mut q = queries();
+        q.windows.as_mut().unwrap()[0].id = None;
+        assert_eq!(count_windows(&q).unwrap().effective, 1);
+        assert_eq!(q.cg_calls.get(), 0);
+        q.windows.as_mut().unwrap()[0].id = Some(42);
+        q.onscreen = None;
+        assert_eq!(count_windows(&q).unwrap().effective, 1);
+        assert_eq!(q.space_calls.get(), 0);
+    }
+
+    #[test]
+    fn visible_windows_skip_spaces_and_share_one_cg_snapshot() {
+        let mut q = queries();
+        let window = q.windows.as_ref().unwrap()[0].clone();
+        q.windows.as_mut().unwrap().push(window);
+        q.onscreen = Some(HashSet::from([42]));
+        assert_eq!(
+            count_windows(&q).unwrap(),
+            WindowCount {
+                effective: 2,
+                ordered_out: 0
+            }
+        );
+        assert_eq!(q.cg_calls.get(), 1);
+        assert_eq!(q.space_calls.get(), 0);
+    }
+
+    #[test]
+    fn inactive_and_unknown_spaces_are_not_ordered_out() {
+        for current in [Some(false), None] {
+            let mut q = queries();
+            q.current = current;
+            assert_eq!(
+                count_windows(&q).unwrap(),
+                WindowCount {
+                    effective: 1,
+                    ordered_out: 0
+                }
+            );
+        }
+        assert_eq!(
+            count_windows(&queries()).unwrap(),
+            WindowCount {
+                effective: 0,
+                ordered_out: 1
+            }
+        );
+    }
+
+    #[test]
+    fn subrole_failure_after_an_ordered_out_window_invalidates_the_snapshot() {
+        let mut q = queries();
+        q.windows.as_mut().unwrap().push(Window {
+            subrole: Err(AXError::InvalidUIElement),
+            minimized: false,
+            id: Some(43),
+        });
+        assert_eq!(count_windows(&q), Err(AXError::InvalidUIElement));
+    }
+
+    #[test]
+    fn visible_and_inactive_windows_veto_both_evidence_policies() {
+        for policy in [CgWindowPolicy::Confirmed, CgWindowPolicy::Conservative] {
+            for current in [None, Some(false), Some(true)] {
+                for any in [None, Some(false), Some(true)] {
+                    assert!(cg_window_vetoes_quit(Some(true), current, any, policy));
+                }
+            }
+            for any in [None, Some(true)] {
+                assert!(cg_window_vetoes_quit(Some(false), Some(false), any, policy));
+            }
+        }
+    }
+
+    #[test]
+    fn cg_dictionary_reads_reject_missing_and_wrong_types() {
+        use objc2_core_foundation::{CFBoolean, CFString};
+        let key = CFString::from_str("value");
+        let missing = CFString::from_str("missing");
+        let number = CFNumber::new_i64(42);
+        let dict = CFDictionary::<CFType, CFType>::from_slices(&[key.as_ref()], &[number.as_ref()]);
+        let dict = dict.as_opaque();
+        assert_eq!(dict_i64(dict, &key), Some(42));
+        assert_eq!(dict_f64(dict, &key), Some(42.0));
+        assert_eq!(dict_bool(dict, &key), None);
+        assert_eq!(dict_i64(dict, &missing), None);
+        assert_eq!(dict_bool(dict, &missing), None);
+        assert_eq!(dict_f64(dict, &missing), None);
+        for value in [false, true] {
+            let boolean = CFBoolean::new(value);
+            let dict =
+                CFDictionary::<CFType, CFType>::from_slices(&[key.as_ref()], &[boolean.as_ref()]);
+            let dict = dict.as_opaque();
+            assert_eq!(dict_bool(dict, &key), Some(value));
+            assert_eq!(dict_i64(dict, &key), None);
+            assert_eq!(dict_f64(dict, &key), None);
+        }
+    }
 
     fn conservative(onscreen: Option<bool>, on_current_space: Option<bool>) -> bool {
         cg_window_vetoes_quit(

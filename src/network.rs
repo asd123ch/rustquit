@@ -242,3 +242,108 @@ pub fn get(url: &str, max_response_bytes: usize) -> Result<PendingRequest, Strin
         _delegate: delegate,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use block2::RcBlock;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn response_is_bounded_and_delivered_once() {
+        let (sender, receiver) = mpsc::channel();
+        let delegate = SessionDelegate::new(4, sender);
+        let session = NSURLSession::sessionWithConfiguration(
+            &NSURLSessionConfiguration::ephemeralSessionConfiguration(),
+        );
+        let url = NSURL::URLWithString(&NSString::from_str("https://example.invalid/")).unwrap();
+        let task = session.dataTaskWithURL(&url);
+        let response = NSHTTPURLResponse::initWithURL_statusCode_HTTPVersion_headerFields(
+            NSHTTPURLResponse::alloc(),
+            &url,
+            200,
+            None,
+            None,
+        )
+        .unwrap();
+        let allowed = Arc::new(AtomicBool::new(false));
+        let result = allowed.clone();
+        let callback = RcBlock::new(move |disposition| {
+            result.store(
+                disposition == NSURLSessionResponseDisposition::Allow,
+                Ordering::SeqCst,
+            );
+        });
+        unsafe {
+            delegate.URLSession_dataTask_didReceiveResponse_completionHandler(
+                &session, &task, &response, &callback,
+            );
+        }
+        assert!(allowed.load(Ordering::SeqCst));
+        delegate.URLSession_dataTask_didReceiveData(&session, &task, &NSData::with_bytes(b"1234"));
+        delegate.URLSession_task_didCompleteWithError(&session, &task, None);
+        let result = receiver.recv().unwrap().unwrap();
+        assert_eq!(result.status, 200);
+        assert_eq!(result.final_url, "https://example.invalid/");
+        assert_eq!(result.body, b"1234");
+        delegate.URLSession_task_didCompleteWithError(&session, &task, None);
+        assert!(receiver.try_recv().is_err());
+        session.invalidateAndCancel();
+    }
+
+    #[test]
+    fn oversized_chunks_fail_without_growing_the_buffer() {
+        let (sender, receiver) = mpsc::channel();
+        let delegate = SessionDelegate::new(4, sender);
+        let session = NSURLSession::sessionWithConfiguration(
+            &NSURLSessionConfiguration::ephemeralSessionConfiguration(),
+        );
+        let url = NSURL::URLWithString(&NSString::from_str("https://example.invalid/")).unwrap();
+        let task = session.dataTaskWithURL(&url);
+        delegate.URLSession_dataTask_didReceiveData(&session, &task, &NSData::with_bytes(b"1234"));
+        delegate.URLSession_dataTask_didReceiveData(&session, &task, &NSData::with_bytes(b"5"));
+        assert_eq!(delegate.ivars().state.lock().unwrap().body, b"1234");
+        delegate.URLSession_task_didCompleteWithError(&session, &task, None);
+        assert_eq!(
+            receiver.recv().unwrap().err().as_deref(),
+            Some("the server response was too large")
+        );
+        session.invalidateAndCancel();
+    }
+
+    #[test]
+    fn redirects_are_rejected() {
+        let (sender, _receiver) = mpsc::channel();
+        let delegate = SessionDelegate::new(4, sender);
+        let session = NSURLSession::sessionWithConfiguration(
+            &NSURLSessionConfiguration::ephemeralSessionConfiguration(),
+        );
+        let url = NSURL::URLWithString(&NSString::from_str("https://example.invalid/")).unwrap();
+        let task = session.dataTaskWithURL(&url);
+        let response = NSHTTPURLResponse::initWithURL_statusCode_HTTPVersion_headerFields(
+            NSHTTPURLResponse::alloc(),
+            &url,
+            302,
+            None,
+            None,
+        )
+        .unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let result = cancelled.clone();
+        let callback = RcBlock::new(move |request: *mut NSURLRequest| {
+            result.store(request.is_null(), Ordering::SeqCst);
+        });
+        unsafe {
+            delegate.URLSession_task_willPerformHTTPRedirection_newRequest_completionHandler(
+                &session,
+                &task,
+                &response,
+                &NSURLRequest::requestWithURL(&url),
+                &callback,
+            );
+        }
+        assert!(cancelled.load(Ordering::SeqCst));
+        session.invalidateAndCancel();
+    }
+}

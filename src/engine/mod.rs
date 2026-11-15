@@ -28,7 +28,7 @@ use objc2_foundation::NSTimer;
 
 use watcher::Watcher;
 
-use crate::config::{Config, ConfigHandle, FilterMode};
+use crate::config::{Config, ConfigHandle, FilterMode, is_app_listed};
 use recent::RecentQuitsHandle;
 
 /// AX events around a Space switch are noisy (windows can briefly
@@ -74,6 +74,15 @@ pub(crate) enum QuitEvidence {
     HiddenWindowless,
 }
 
+impl QuitEvidence {
+    fn cg_policy(self) -> counter::CgWindowPolicy {
+        match self {
+            Self::WindowDestroyed | Self::HiddenWindowless => counter::CgWindowPolicy::Confirmed,
+            Self::WindowStateChanged => counter::CgWindowPolicy::Conservative,
+        }
+    }
+}
+
 struct RecountRequest {
     pid: libc::pid_t,
     generation: u64,
@@ -94,6 +103,66 @@ struct PendingTermination {
     name: String,
     generation: u64,
     requested_at: Instant,
+}
+
+struct QuitSnapshot {
+    generation: u64,
+    allowed: bool,
+    terminated: bool,
+    finished_launching: bool,
+    pending: bool,
+    space_change_recent: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum QuitStep {
+    Cancel,
+    Defer,
+    Recount,
+    Terminate,
+}
+
+// None means the independent final CG check has not run yet. Some(None)
+// means it ran but failed, which must never authorize termination.
+fn next_quit_step(
+    snapshot: &QuitSnapshot,
+    generation: u64,
+    cg_count: Option<Option<usize>>,
+) -> QuitStep {
+    if snapshot.generation != generation
+        || !snapshot.allowed
+        || snapshot.terminated
+        || !snapshot.finished_launching
+        || snapshot.pending
+    {
+        return QuitStep::Cancel;
+    }
+    if snapshot.space_change_recent {
+        return QuitStep::Defer;
+    }
+    match cg_count {
+        None => QuitStep::Recount,
+        Some(Some(0)) => QuitStep::Terminate,
+        Some(_) => QuitStep::Cancel,
+    }
+}
+
+fn next_generation(nonce: &Cell<u64>) -> u64 {
+    let next = nonce.get().wrapping_add(1).max(1);
+    nonce.set(next);
+    next
+}
+
+fn invalidate_generations<'a>(nonce: &Cell<u64>, generations: impl Iterator<Item = &'a Cell<u64>>) {
+    for generation in generations {
+        generation.set(next_generation(nonce));
+    }
+}
+
+fn space_change_recent_at(last: Option<Instant>, now: Instant) -> bool {
+    last.is_some_and(|last| {
+        now.saturating_duration_since(last).as_secs_f64() < SPACE_CHANGE_GRACE_SECS
+    })
 }
 
 /// Ordered-out standard windows are ambiguous: they may be app-internal
@@ -123,17 +192,10 @@ fn decide_quit(config: &Config, bundle_id: Option<&str>) -> bool {
     // Apps marked "keep running" are never auto-quit — even while the
     // keep-alive master toggle is off, quitting them is clearly against
     // the user's intent (and would make RustQuit fight itself).
-    if config
-        .keep_alive_apps
-        .iter()
-        .any(|b| b.eq_ignore_ascii_case(bundle_id))
-    {
+    if is_app_listed(&config.keep_alive_apps, bundle_id) {
         return false;
     }
-    let listed = config
-        .apps
-        .iter()
-        .any(|b| b.eq_ignore_ascii_case(bundle_id));
+    let listed = is_app_listed(&config.apps, bundle_id);
     match config.mode {
         FilterMode::Whitelist => listed,
         FilterMode::Blacklist => !listed,
@@ -163,6 +225,9 @@ impl Engine {
     /// launch/terminate/deactivate. Must only be called once the
     /// Accessibility permission has been granted.
     pub fn start(config: ConfigHandle, recent_quits: RecentQuitsHandle) -> io::Result<Rc<Engine>> {
+        ax::configure_messaging_timeout().map_err(|error| {
+            io::Error::other(format!("cannot set Accessibility timeout: {error:?}"))
+        })?;
         let (recount_tx, worker_rx) = mpsc::sync_channel::<RecountRequest>(RECOUNT_QUEUE_CAPACITY);
         let (worker_tx, recount_rx) = mpsc::sync_channel::<RecountResult>(RECOUNT_QUEUE_CAPACITY);
         thread::Builder::new()
@@ -172,15 +237,7 @@ impl Engine {
                     let count = counter::effective_window_count(request.pid);
                     let cg_count = match request.phase {
                         RecountPhase::FinalCheck(evidence) => {
-                            let policy = match evidence {
-                                QuitEvidence::WindowDestroyed | QuitEvidence::HiddenWindowless => {
-                                    counter::CgWindowPolicy::Confirmed
-                                }
-                                QuitEvidence::WindowStateChanged => {
-                                    counter::CgWindowPolicy::Conservative
-                                }
-                            };
-                            counter::cg_window_count(request.pid, policy)
+                            counter::cg_window_count(request.pid, evidence.cg_policy())
                         }
                         RecountPhase::WindowDestroyed | RecountPhase::WindowStateChanged => None,
                     };
@@ -257,7 +314,7 @@ impl Engine {
         if pid == self.own_pid || self.watchers.borrow().contains_key(&pid) {
             return;
         }
-        let generation = self.next_generation();
+        let generation = next_generation(&self.generation_nonce);
         match Watcher::new(app.clone(), Rc::downgrade(self), generation) {
             Ok((watcher, windows_ready)) => {
                 tracing::debug!(pid, "watcher created");
@@ -374,9 +431,10 @@ impl Engine {
         // and delayed quit immediately; only fresh post-transition evidence may
         // start another decision.
         let watchers = self.watchers.borrow();
-        for watcher in watchers.values() {
-            watcher.generation.set(self.next_generation());
-        }
+        invalidate_generations(
+            &self.generation_nonce,
+            watchers.values().map(|watcher| &watcher.generation),
+        );
         tracing::debug!(
             apps = watchers.len(),
             "active Space changed; cancelled pending quit checks"
@@ -384,9 +442,7 @@ impl Engine {
     }
 
     fn space_change_recent(&self) -> bool {
-        self.last_space_change
-            .get()
-            .is_some_and(|t| t.elapsed().as_secs_f64() < SPACE_CHANGE_GRACE_SECS)
+        space_change_recent_at(self.last_space_change.get(), Instant::now())
     }
 
     /// Called by the C callback (via CallbackContext) on the main thread.
@@ -405,7 +461,10 @@ impl Engine {
                 self.bump_generation(watcher);
                 self.pending_terminations.borrow_mut().remove(&pid);
                 let retained = unsafe { CFRetained::retain(NonNull::from(element)) };
-                watcher.watch_window(retained);
+                if let Err(error) = watcher.watch_window(retained) {
+                    tracing::debug!(pid, ?error, "window type unavailable; scheduling retry");
+                    self.schedule_window_sync(pid, 1);
+                }
                 tracing::debug!(pid, "window created");
             }
             ax::NOTIF_ELEMENT_DESTROYED => {
@@ -459,34 +518,38 @@ impl Engine {
         let Some(watcher) = watchers.get(&pid) else {
             return;
         };
-        if watcher.generation.get() != generation {
-            tracing::debug!(pid, "quit cancelled: new window event during the delay");
-            return;
-        }
-        if !self.should_quit(watcher) {
-            tracing::debug!(pid, "quit cancelled: configuration changed");
-            return;
-        }
-        if watcher.app.isTerminated() || !watcher.app.isFinishedLaunching() {
-            return;
-        }
-        // AX events around Space switches are unreliable; defer, re-check later.
-        if self.space_change_recent() {
-            tracing::debug!(pid, "quit deferred: active Space changed recently");
-            quitter::schedule(
-                Rc::downgrade(self),
-                pid,
-                generation,
-                evidence,
-                SPACE_CHANGE_GRACE_SECS,
-            );
-            return;
-        }
-        if self.pending_terminations.borrow().contains_key(&pid) {
-            return;
+        match next_quit_step(
+            &self.quit_snapshot(watcher, pid, generation),
+            generation,
+            None,
+        ) {
+            QuitStep::Cancel => return,
+            QuitStep::Defer => {
+                quitter::schedule(
+                    Rc::downgrade(self),
+                    pid,
+                    generation,
+                    evidence,
+                    SPACE_CHANGE_GRACE_SECS,
+                );
+                return;
+            }
+            QuitStep::Recount => {}
+            QuitStep::Terminate => unreachable!(),
         }
         drop(watchers);
         self.request_recount(pid, generation, RecountPhase::FinalCheck(evidence));
+    }
+
+    fn quit_snapshot(&self, watcher: &Watcher, pid: libc::pid_t, generation: u64) -> QuitSnapshot {
+        QuitSnapshot {
+            generation: watcher.generation.get(),
+            allowed: watcher.generation.get() == generation && self.should_quit(watcher),
+            terminated: watcher.app.isTerminated(),
+            finished_launching: watcher.app.isFinishedLaunching(),
+            pending: self.pending_terminations.borrow().contains_key(&pid),
+            space_change_recent: self.space_change_recent(),
+        }
     }
 
     fn request_recount(self: &Rc<Self>, pid: libc::pid_t, generation: u64, phase: RecountPhase) {
@@ -607,35 +670,24 @@ impl Engine {
         let Some(watcher) = watchers.get(&pid) else {
             return;
         };
-        if watcher.generation.get() != generation
-            || !self.should_quit(watcher)
-            || watcher.app.isTerminated()
-            || !watcher.app.isFinishedLaunching()
-            || self.pending_terminations.borrow().contains_key(&pid)
-        {
-            return;
-        }
-        if self.space_change_recent() {
-            quitter::schedule(
-                Rc::downgrade(self),
-                pid,
-                generation,
-                evidence,
-                SPACE_CHANGE_GRACE_SECS,
-            );
-            return;
-        }
-        match cg_count {
-            Some(0) => {}
-            Some(n) => {
-                // E.g. a full-screen window on another Space: don't quit.
-                tracing::debug!(pid, n, "quit cancelled: CG count reports windows");
+        match next_quit_step(
+            &self.quit_snapshot(watcher, pid, generation),
+            generation,
+            Some(cg_count),
+        ) {
+            QuitStep::Cancel => return,
+            QuitStep::Defer => {
+                quitter::schedule(
+                    Rc::downgrade(self),
+                    pid,
+                    generation,
+                    evidence,
+                    SPACE_CHANGE_GRACE_SECS,
+                );
                 return;
             }
-            None => {
-                tracing::debug!(pid, "quit cancelled: CG count failed");
-                return;
-            }
+            QuitStep::Terminate => {}
+            QuitStep::Recount => unreachable!(),
         }
         let pending_generation = self.bump_generation(watcher);
         let name = watcher
@@ -678,17 +730,8 @@ impl Engine {
         }
     }
 
-    fn next_generation(&self) -> u64 {
-        let mut next = self.generation_nonce.get().wrapping_add(1);
-        if next == 0 {
-            next = 1;
-        }
-        self.generation_nonce.set(next);
-        next
-    }
-
     fn bump_generation(&self, watcher: &Watcher) -> u64 {
-        let generation = self.next_generation();
+        let generation = next_generation(&self.generation_nonce);
         watcher.generation.set(generation);
         generation
     }
@@ -710,6 +753,141 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn ready() -> QuitSnapshot {
+        QuitSnapshot {
+            generation: 12,
+            allowed: true,
+            terminated: false,
+            finished_launching: true,
+            pending: false,
+            space_change_recent: false,
+        }
+    }
+
+    #[test]
+    fn termination_requires_a_successful_independent_empty_cg_count() {
+        assert_eq!(next_quit_step(&ready(), 12, None), QuitStep::Recount);
+        assert_eq!(next_quit_step(&ready(), 12, Some(None)), QuitStep::Cancel);
+        assert_eq!(
+            next_quit_step(&ready(), 12, Some(Some(1))),
+            QuitStep::Cancel
+        );
+        assert_eq!(
+            next_quit_step(&ready(), 12, Some(Some(0))),
+            QuitStep::Terminate
+        );
+    }
+
+    #[test]
+    fn new_window_events_cancel_stale_timers_and_worker_results() {
+        for cg in [None, Some(None), Some(Some(0))] {
+            assert_eq!(next_quit_step(&ready(), 11, cg), QuitStep::Cancel);
+        }
+    }
+
+    #[test]
+    fn configuration_lifecycle_and_pending_requests_are_rechecked_at_both_stages() {
+        let cases = [
+            QuitSnapshot {
+                allowed: false,
+                ..ready()
+            },
+            QuitSnapshot {
+                terminated: true,
+                ..ready()
+            },
+            QuitSnapshot {
+                finished_launching: false,
+                ..ready()
+            },
+            QuitSnapshot {
+                pending: true,
+                ..ready()
+            },
+        ];
+        for snapshot in cases {
+            assert_eq!(next_quit_step(&snapshot, 12, None), QuitStep::Cancel);
+            assert_eq!(
+                next_quit_step(&snapshot, 12, Some(Some(0))),
+                QuitStep::Cancel
+            );
+        }
+    }
+
+    #[test]
+    fn spaces_defer_fresh_checks_but_never_revive_stale_generations() {
+        let snapshot = QuitSnapshot {
+            space_change_recent: true,
+            ..ready()
+        };
+        for cg in [None, Some(Some(0))] {
+            assert_eq!(next_quit_step(&snapshot, 12, cg), QuitStep::Defer);
+            assert_eq!(next_quit_step(&snapshot, 11, cg), QuitStep::Cancel);
+        }
+    }
+
+    #[test]
+    fn space_changes_invalidate_every_app_and_repeated_switches() {
+        let nonce = Cell::new(12);
+        let apps = [Cell::new(11), Cell::new(12)];
+        invalidate_generations(&nonce, apps.iter());
+        assert_eq!((apps[0].get(), apps[1].get()), (13, 14));
+        invalidate_generations(&nonce, apps.iter());
+        assert_eq!((apps[0].get(), apps[1].get()), (15, 16));
+        // A watcher created after a PID is reused cannot accept the old result.
+        assert_eq!(next_generation(&nonce), 17);
+    }
+
+    #[test]
+    fn generation_rollover_never_uses_the_uninitialized_zero_value() {
+        let nonce = Cell::new(u64::MAX);
+        assert_eq!(next_generation(&nonce), 1);
+        assert_eq!(next_generation(&nonce), 2);
+    }
+
+    #[test]
+    fn spaces_grace_interval_has_a_deterministic_boundary() {
+        let now = Instant::now();
+        assert!(!space_change_recent_at(None, now));
+        assert!(space_change_recent_at(
+            Some(now),
+            now + Duration::from_millis(2999)
+        ));
+        assert!(!space_change_recent_at(
+            Some(now),
+            now + Duration::from_secs(3)
+        ));
+        assert!(space_change_recent_at(
+            Some(now + Duration::from_secs(1)),
+            now
+        ));
+    }
+
+    #[test]
+    fn callback_panics_are_contained_and_later_callbacks_still_run() {
+        catch_callback_panic("synthetic panic", || panic!("synthetic callback failure"));
+        let completed = Cell::new(false);
+        catch_callback_panic("next callback", || completed.set(true));
+        assert!(completed.get());
+    }
+
+    #[test]
+    fn weak_focus_events_do_not_gain_destroyed_window_privileges() {
+        assert_eq!(
+            QuitEvidence::WindowStateChanged.cg_policy(),
+            counter::CgWindowPolicy::Conservative
+        );
+        assert_eq!(
+            QuitEvidence::WindowDestroyed.cg_policy(),
+            counter::CgWindowPolicy::Confirmed
+        );
+        assert_eq!(
+            QuitEvidence::HiddenWindowless.cg_policy(),
+            counter::CgWindowPolicy::Confirmed
+        );
+    }
 
     fn config(mode: FilterMode, apps: &[&str], enabled: bool) -> Config {
         Config {

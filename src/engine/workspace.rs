@@ -135,3 +135,53 @@ pub fn regular_running_apps() -> Vec<Retained<NSRunningApplication>> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::{NSDictionary, NSString};
+
+    #[test]
+    fn workspace_notifications_without_app_data_are_ignored() {
+        let name = NSString::from_str("synthetic.notification");
+        let notification =
+            unsafe { NSNotification::notificationWithName_object_userInfo(&name, None, None) };
+        assert!(running_app_from(&notification).is_none());
+        let wrong_value = NSString::from_str("not an application");
+        let dictionary = NSDictionary::<NSString, AnyObject>::from_slices(
+            &[unsafe { NSWorkspaceApplicationKey }],
+            &[wrong_value.as_ref()],
+        );
+        // Erasing generic types preserves the Foundation dictionary and its objects.
+        let dictionary: Retained<NSDictionary> = unsafe { Retained::cast_unchecked(dictionary) };
+        let notification = unsafe {
+            NSNotification::notificationWithName_object_userInfo(&name, None, Some(&dictionary))
+        };
+        assert!(running_app_from(&notification).is_none());
+    }
+
+    #[test]
+    fn workspace_app_is_retained_after_notification_is_dropped() {
+        let app = NSRunningApplication::currentApplication();
+        let pid = app.processIdentifier();
+        let dictionary = NSDictionary::<NSString, AnyObject>::from_slices(
+            &[unsafe { NSWorkspaceApplicationKey }],
+            &[app.as_ref()],
+        );
+        let dictionary: Retained<NSDictionary> = unsafe { Retained::cast_unchecked(dictionary) };
+        let notification = unsafe {
+            NSNotification::notificationWithName_object_userInfo(
+                &NSString::from_str("synthetic.notification"),
+                None,
+                Some(&dictionary),
+            )
+        };
+        let decoded = running_app_from(&notification).unwrap();
+        assert_eq!(Retained::as_ptr(&decoded), Retained::as_ptr(&app));
+        drop(notification);
+        drop(dictionary);
+        drop(app);
+        assert_eq!(decoded.processIdentifier(), pid);
+    }
+}

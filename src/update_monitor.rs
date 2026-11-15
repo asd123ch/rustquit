@@ -7,23 +7,11 @@ use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSWorkspace};
 use objc2_foundation::{NSString, NSTimer, NSURL, ns_string};
-use serde::Deserialize;
 
 use crate::config::ConfigHandle;
-use crate::network::{PendingRequest, Response};
-
-const RELEASE_API: &str = "https://api.github.com/repos/asd123ch/rustquit/releases/latest";
-const RELEASES_URL: &str = "https://github.com/asd123ch/rustquit/releases";
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum UpdateStatus {
-    Idle,
-    Checking,
-    UpToDate,
-    Available { version: String, url: String },
-    Unavailable,
-}
+use crate::network::PendingRequest;
+pub use crate::release_data::UpdateStatus;
+use crate::release_data::{MAX_RESPONSE_BYTES, RELEASE_API, parse_release};
 
 impl UpdateStatus {
     fn menu_title(&self) -> Option<String> {
@@ -32,14 +20,6 @@ impl UpdateStatus {
             _ => None,
         }
     }
-}
-
-#[derive(Deserialize)]
-struct Release {
-    tag_name: String,
-    html_url: String,
-    draft: bool,
-    prerelease: bool,
 }
 
 pub struct UpdateMonitor {
@@ -128,8 +108,13 @@ impl UpdateMonitor {
     fn poll(&self) {
         let result = self.pending.borrow().as_ref().map(PendingRequest::try_recv);
         let status = match result {
-            Some(Ok(Ok(response))) => parse_release(response, env!("CARGO_PKG_VERSION"))
-                .unwrap_or(UpdateStatus::Unavailable),
+            Some(Ok(Ok(response))) => parse_release(
+                response.status,
+                &response.final_url,
+                &response.body,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .unwrap_or(UpdateStatus::Unavailable),
             Some(Ok(Err(_))) | Some(Err(TryRecvError::Disconnected)) => UpdateStatus::Unavailable,
             Some(Err(TryRecvError::Empty)) | None => return,
         };
@@ -191,41 +176,20 @@ impl Drop for UpdateMonitor {
     }
 }
 
-fn parse_release(response: Response, current: &str) -> Result<UpdateStatus, ()> {
-    if response.final_url != RELEASE_API || response.body.len() > MAX_RESPONSE_BYTES {
-        return Err(());
-    }
-    if response.status == 404 {
-        return Ok(UpdateStatus::UpToDate);
-    }
-    if response.status != 200 {
-        return Err(());
-    }
-    let release: Release = serde_json::from_slice(&response.body).map_err(|_| ())?;
-    let version =
-        semver::Version::parse(release.tag_name.strip_prefix('v').ok_or(())?).map_err(|_| ())?;
-    let expected_url = format!("{RELEASES_URL}/tag/v{version}");
-    if release.draft
-        || release.prerelease
-        || !version.pre.is_empty()
-        || !version.build.is_empty()
-        || release.html_url != expected_url
-    {
-        return Err(());
-    }
-    if version > semver::Version::parse(current).map_err(|_| ())? {
-        Ok(UpdateStatus::Available {
-            version: version.to_string(),
-            url: expected_url,
-        })
-    } else {
-        Ok(UpdateStatus::UpToDate)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::Response;
+    use crate::release_data::{InvalidRelease, RELEASES_URL};
+
+    fn parse_response(response: Response, current: &str) -> Result<UpdateStatus, InvalidRelease> {
+        parse_release(
+            response.status,
+            &response.final_url,
+            &response.body,
+            current,
+        )
+    }
 
     #[test]
     fn menu_entry_exists_only_for_an_available_update() {
@@ -264,12 +228,12 @@ mod tests {
     #[test]
     fn offers_only_newer_versions() {
         assert!(matches!(
-            parse_release(response("0.4.10"), "0.4.8"),
+            parse_response(response("0.4.10"), "0.4.8"),
             Ok(UpdateStatus::Available { .. })
         ));
         for version in ["0.4.8", "0.4.1"] {
             assert_eq!(
-                parse_release(response(version), "0.4.8"),
+                parse_response(response(version), "0.4.8"),
                 Ok(UpdateStatus::UpToDate)
             );
         }
@@ -289,10 +253,10 @@ mod tests {
             let mut body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
             body[field] = value;
             response.body = serde_json::to_vec(&body).unwrap();
-            assert!(parse_release(response, "0.4.8").is_err());
+            assert!(parse_response(response, "0.4.8").is_err());
         }
         for version in ["0.5.0-beta.1", "0.5.0+build", "invalid"] {
-            assert!(parse_release(response(version), "0.4.8").is_err());
+            assert!(parse_response(response(version), "0.4.8").is_err());
         }
     }
 
@@ -300,17 +264,17 @@ mod tests {
     fn handles_missing_releases_and_network_failures() {
         let mut missing = response("0.4.9");
         missing.status = 404;
-        assert_eq!(parse_release(missing, "0.4.8"), Ok(UpdateStatus::UpToDate));
+        assert_eq!(parse_response(missing, "0.4.8"), Ok(UpdateStatus::UpToDate));
         for status in [301, 403, 429, 500] {
             let mut failed = response("0.4.9");
             failed.status = status;
-            assert!(parse_release(failed, "0.4.8").is_err());
+            assert!(parse_response(failed, "0.4.8").is_err());
         }
         let mut redirected = response("0.4.9");
         redirected.final_url = "https://example.com".to_owned();
-        assert!(parse_release(redirected, "0.4.8").is_err());
+        assert!(parse_response(redirected, "0.4.8").is_err());
         let mut malformed = response("0.4.9");
         malformed.body = b"not json".to_vec();
-        assert!(parse_release(malformed, "0.4.8").is_err());
+        assert!(parse_response(malformed, "0.4.8").is_err());
     }
 }

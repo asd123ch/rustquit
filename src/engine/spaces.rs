@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
-use objc2_core_foundation::{CFArray, CFNumber, CFRetained};
+use objc2_core_foundation::{CFArray, CFNumber, CFRetained, CFType};
 
 /// `SLSCopySpacesForWindows` selection mask for Spaces that are currently
 /// visible on any display ("current" Spaces).
@@ -31,15 +31,11 @@ type MainConnectionIdFn = unsafe extern "C" fn() -> i32;
 type CopySpacesForWindowsFn =
     unsafe extern "C" fn(cid: i32, mask: i32, window_ids: *const c_void) -> *mut CFArray;
 
+// The window server serializes requests per connection.
 struct SkyLight {
     connection: i32,
     copy_spaces_for_windows: CopySpacesForWindowsFn,
 }
-
-// The connection id is a plain token and the function pointer is stateless;
-// the window server serializes requests per connection.
-unsafe impl Send for SkyLight {}
-unsafe impl Sync for SkyLight {}
 
 fn skylight() -> Option<&'static SkyLight> {
     static INSTANCE: OnceLock<Option<SkyLight>> = OnceLock::new();
@@ -92,7 +88,14 @@ pub fn on_any_space(window_id: u32) -> Option<bool> {
 }
 
 fn has_space(window_id: u32, mask: i32) -> Option<bool> {
-    let sky = skylight()?;
+    query_space(skylight(), window_id, mask)
+}
+
+fn query_space(sky: Option<&SkyLight>, window_id: u32, mask: i32) -> Option<bool> {
+    if window_id == 0 {
+        return None;
+    }
+    let sky = sky?;
     let ids = CFArray::from_retained_objects(&[CFNumber::new_i64(i64::from(window_id))]);
     let spaces = unsafe {
         (sky.copy_spaces_for_windows)(
@@ -101,6 +104,76 @@ fn has_space(window_id: u32, mask: i32) -> Option<bool> {
             CFRetained::as_ptr(&ids).as_ptr().cast(),
         )
     };
-    let spaces = unsafe { CFRetained::from_raw(NonNull::new(spaces)?) };
+    let spaces = unsafe { CFRetained::<CFType>::from_raw(NonNull::new(spaces)?.cast()) };
+    let spaces = spaces.downcast::<CFArray>().ok()?;
     Some(spaces.count() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_core_foundation::CFString;
+    use std::cell::Cell;
+
+    thread_local! {
+        static REQUEST: Cell<(i32, i32, i64)> = const { Cell::new((0, 0, 0)) };
+    }
+
+    unsafe extern "C" fn spaces(cid: i32, mask: i32, ids: *const c_void) -> *mut CFArray {
+        let ids = unsafe { &*ids.cast::<CFArray>() };
+        let id = unsafe { &*ids.value_at_index(0).cast::<CFNumber>() };
+        REQUEST.set((cid, mask, id.as_i64().unwrap()));
+        let values = if mask == SPACE_MASK_ALL {
+            vec![CFNumber::new_i64(7)]
+        } else {
+            vec![]
+        };
+        CFRetained::into_raw(CFArray::from_retained_objects(&values))
+            .as_ptr()
+            .cast()
+    }
+
+    unsafe extern "C" fn failed(_: i32, _: i32, _: *const c_void) -> *mut CFArray {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "C" fn wrong_type(_: i32, _: i32, _: *const c_void) -> *mut CFArray {
+        CFRetained::into_raw(CFString::from_str("invalid response"))
+            .as_ptr()
+            .cast()
+    }
+
+    #[test]
+    fn current_and_all_spaces_queries_preserve_mask_and_window_id() {
+        let sky = SkyLight {
+            connection: 19,
+            copy_spaces_for_windows: spaces,
+        };
+        assert_eq!(query_space(Some(&sky), 42, SPACE_MASK_CURRENT), Some(false));
+        assert_eq!(REQUEST.get(), (19, 5, 42));
+        assert_eq!(
+            query_space(Some(&sky), u32::MAX, SPACE_MASK_ALL),
+            Some(true)
+        );
+        assert_eq!(REQUEST.get(), (19, 7, i64::from(u32::MAX)));
+    }
+
+    #[test]
+    fn missing_bridge_invalid_id_and_failed_queries_remain_unknown() {
+        assert_eq!(query_space(None, 42, SPACE_MASK_ALL), None);
+        for callback in [failed as CopySpacesForWindowsFn, wrong_type] {
+            let sky = SkyLight {
+                connection: 19,
+                copy_spaces_for_windows: callback,
+            };
+            assert_eq!(query_space(Some(&sky), 42, SPACE_MASK_ALL), None);
+        }
+        let sky = SkyLight {
+            connection: 19,
+            copy_spaces_for_windows: spaces,
+        };
+        REQUEST.set((0, 0, 0));
+        assert_eq!(query_space(Some(&sky), 0, SPACE_MASK_CURRENT), None);
+        assert_eq!(REQUEST.get(), (0, 0, 0));
+    }
 }

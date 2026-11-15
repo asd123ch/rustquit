@@ -2,7 +2,6 @@
 //! A corrupt or missing file never crashes the app — it just yields defaults.
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -11,74 +10,10 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use crate::config_data::{Config, FilterMode, is_app_listed};
+use crate::config_data::{MAX_CONFIG_BYTES, normalize_settings, parse_config};
 use objc2_foundation::NSFileManager;
-use serde::{Deserialize, Serialize};
-
-const MAX_APPS: usize = 4096;
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
-const MIN_QUIT_DELAY_SECS: f64 = 0.05;
-const MAX_QUIT_DELAY_SECS: f64 = 10.0;
-const MIN_RESTART_DELAY_SECS: f64 = 1.0;
-const MAX_RESTART_DELAY_SECS: f64 = 60.0;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FilterMode {
-    /// Quit all apps except the listed ones.
-    Blacklist,
-    /// Quit only the listed apps.
-    Whitelist,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Config {
-    pub mode: FilterMode,
-    pub quit_delay_secs: f64,
-    pub enabled: bool,
-    pub check_for_updates: bool,
-    /// Bundle IDs; their meaning depends on the mode.
-    pub apps: Vec<String>,
-    /// Master toggle for relaunching the keep-alive apps.
-    pub keep_alive_enabled: bool,
-    /// Restore missing kept apps when RustQuit starts, unless a related
-    /// background helper already keeps the app suite running.
-    #[serde(alias = "keep_alive_launch_at_startup")]
-    pub keep_alive_auto_start_missing: bool,
-    /// Wait after a keep-alive app terminates before relaunching it, so
-    /// self-relaunching updaters win the race.
-    pub keep_alive_delay_secs: f64,
-    /// After repeated automatic restarts within an hour, pause keep-alive
-    /// for the app until the next day (guards against crash loops).
-    pub keep_alive_loop_protection: bool,
-    /// Bundle IDs to keep running. Listed apps are never auto-quit, even
-    /// while the keep-alive master toggle is off.
-    pub keep_alive_apps: Vec<String>,
-    /// Lowercase bundle ID -> Unix timestamp through which automatic Keep
-    /// launches are suppressed. Entries are created from the tray menu.
-    pub keep_alive_ignored_until: BTreeMap<String, u64>,
-}
-
-impl Default for Config {
-    fn default() -> Config {
-        Config {
-            // Deliberately conservative default: whitelist + empty list
-            // does nothing until the user adds apps.
-            mode: FilterMode::Whitelist,
-            quit_delay_secs: 2.0,
-            enabled: true,
-            check_for_updates: true,
-            apps: Vec::new(),
-            keep_alive_enabled: true,
-            keep_alive_auto_start_missing: true,
-            keep_alive_delay_secs: 10.0,
-            keep_alive_loop_protection: true,
-            keep_alive_apps: Vec::new(),
-            keep_alive_ignored_until: BTreeMap::new(),
-        }
-    }
-}
 
 pub struct ConfigStore {
     path: PathBuf,
@@ -104,17 +39,14 @@ impl ConfigStore {
                 Config::default()
             }
             Ok(metadata)
-                if !metadata.file_type().is_file() || metadata.len() > MAX_CONFIG_BYTES =>
+                if !metadata.file_type().is_file() || metadata.len() > MAX_CONFIG_BYTES as u64 =>
             {
                 tracing::warn!("configuration is not a safe regular file; using defaults");
                 Config::default()
             }
             Ok(_) => match std::fs::read_to_string(&path) {
-                Ok(text) => match toml::from_str::<Config>(&text) {
-                    Ok(mut config) => {
-                        normalize(&mut config);
-                        config
-                    }
+                Ok(text) => match parse_config(&text, unix_timestamp()) {
+                    Ok(config) => config,
                     Err(_) => {
                         tracing::warn!("configuration invalid; using safe defaults");
                         Config::default()
@@ -140,7 +72,8 @@ impl ConfigStore {
         {
             let mut config = self.data.borrow_mut();
             change(&mut config);
-            normalize(&mut config);
+            // Expiry timers still need their entries, including after sleep.
+            normalize_settings(&mut config);
         }
         if let Err(err) = self.save_current() {
             self.data.replace(previous);
@@ -240,57 +173,11 @@ fn config_path() -> PathBuf {
 }
 
 fn set_listed(list: &mut Vec<String>, bundle_id: &str, listed: bool) {
-    let present = list.iter().any(|b| b.eq_ignore_ascii_case(bundle_id));
+    let present = is_app_listed(list, bundle_id);
     if listed && !present {
         list.push(bundle_id.to_string());
     } else if !listed && present {
         list.retain(|b| !b.eq_ignore_ascii_case(bundle_id));
-    }
-}
-
-fn normalize(config: &mut Config) {
-    if !config.quit_delay_secs.is_finite() {
-        config.quit_delay_secs = Config::default().quit_delay_secs;
-    }
-    config.quit_delay_secs = config
-        .quit_delay_secs
-        .clamp(MIN_QUIT_DELAY_SECS, MAX_QUIT_DELAY_SECS);
-
-    if !config.keep_alive_delay_secs.is_finite() {
-        config.keep_alive_delay_secs = Config::default().keep_alive_delay_secs;
-    }
-    config.keep_alive_delay_secs = config
-        .keep_alive_delay_secs
-        .clamp(MIN_RESTART_DELAY_SECS, MAX_RESTART_DELAY_SECS);
-
-    normalize_app_list(&mut config.apps);
-    normalize_app_list(&mut config.keep_alive_apps);
-    normalize_ignored_apps(&mut config.keep_alive_ignored_until);
-
-    // An app cannot be on both lists; keep-alive wins (matches the engine,
-    // which never auto-quits a keep-alive app). The settings window greys
-    // out the other checkbox for the same reason.
-    config.apps.retain(|bundle_id| {
-        !config
-            .keep_alive_apps
-            .iter()
-            .any(|keep| keep.eq_ignore_ascii_case(bundle_id))
-    });
-}
-
-fn normalize_ignored_apps(ignored: &mut BTreeMap<String, u64>) {
-    let now = unix_timestamp();
-    let previous = std::mem::take(ignored);
-    for (bundle_id, until) in previous {
-        if ignored.len() >= MAX_APPS {
-            break;
-        }
-        if until > now && valid_bundle_id(&bundle_id) {
-            ignored
-                .entry(bundle_id.to_ascii_lowercase())
-                .and_modify(|stored| *stored = (*stored).max(until))
-                .or_insert(until);
-        }
     }
 }
 
@@ -301,27 +188,10 @@ pub fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-fn normalize_app_list(list: &mut Vec<String>) {
-    list.retain(|bundle_id| valid_bundle_id(bundle_id));
-    list.sort_by_key(|bundle_id| bundle_id.to_ascii_lowercase());
-    list.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    list.truncate(MAX_APPS);
-}
-
-fn valid_bundle_id(bundle_id: &str) -> bool {
-    !bundle_id.is_empty()
-        && bundle_id.len() <= 255
-        && bundle_id.contains('.')
-        && !bundle_id.starts_with('.')
-        && !bundle_id.ends_with('.')
-        && bundle_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_data::normalize;
 
     fn temp_config_path(name: &str) -> PathBuf {
         std::env::temp_dir()
@@ -344,7 +214,7 @@ mod tests {
             keep_alive_apps: vec!["com.Keep.Me".into(), "no-dot".into()],
             ..Config::default()
         };
-        normalize(&mut config);
+        normalize(&mut config, unix_timestamp());
         assert_eq!(config.quit_delay_secs, 2.0);
         assert_eq!(config.apps, vec!["com.Example.App"]);
         assert_eq!(config.keep_alive_delay_secs, 1.0);
@@ -352,7 +222,7 @@ mod tests {
 
         // An app on both lists stays keep-alive only.
         config.apps = vec!["com.keep.me".into(), "com.Other.App".into()];
-        normalize(&mut config);
+        normalize(&mut config, unix_timestamp());
         assert_eq!(config.apps, vec!["com.Other.App"]);
         assert_eq!(config.keep_alive_apps, vec!["com.Keep.Me"]);
     }
@@ -364,6 +234,40 @@ mod tests {
         let previous = store.data.borrow().clone();
         assert!(store.update(|config| config.enabled = false).is_err());
         assert_eq!(*store.data.borrow(), previous);
+    }
+
+    #[test]
+    fn saving_one_expired_ignore_preserves_other_pending_expiries() {
+        let path = temp_config_path("ignore-expiry");
+        let store = ConfigStore::load_from(path.clone());
+        store.data.borrow_mut().keep_alive_ignored_until.extend([
+            ("com.example.first".into(), 1),
+            ("com.example.second".into(), 2),
+        ]);
+
+        store
+            .set_keep_alive_ignored_until("com.example.first", None)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .data
+                .borrow()
+                .keep_alive_ignored_until
+                .get("com.example.second"),
+            Some(&2)
+        );
+        store.update(|config| config.enabled = false).unwrap();
+        assert_eq!(store.data.borrow().keep_alive_ignored_until.len(), 1);
+        // A fresh process has no pending timers; startup reconciliation owns recovery.
+        assert!(
+            ConfigStore::load_from(path.clone())
+                .data
+                .borrow()
+                .keep_alive_ignored_until
+                .is_empty()
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

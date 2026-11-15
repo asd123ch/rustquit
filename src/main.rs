@@ -2,6 +2,7 @@
 
 mod autostart;
 mod config;
+mod config_data;
 mod engine;
 mod instance;
 mod keepalive;
@@ -9,6 +10,7 @@ mod network;
 mod permissions;
 mod procexit;
 mod protected;
+mod release_data;
 mod settings_window;
 mod tray;
 mod update_monitor;

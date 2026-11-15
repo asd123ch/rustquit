@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.5.1 - 2026-11-15
+
+### Fixed
+
+- Retry window-type checks after temporary Accessibility failures and apply
+  the short messaging timeout to window objects as well as applications.
+- Restore Keep after restart-loop pauses and process every expired manual
+  ignore, including when several deadlines pass during sleep.
+- Restore missing kept apps when Keep is enabled again and when a related
+  background helper exits, without reopening settings while a helper is running.
+- Cancel window recounts when Accessibility cannot identify a window's subrole,
+  instead of treating that window as closed.
+- Reject malformed Accessibility window arrays and malformed Space-query responses.
+- Replace monitor-specific icon color profiles with standard sRGB profiles.
+
+### Changed
+
+- Expand tests for window counting, Spaces transitions, stale quit decisions
+  and native callback handling.
+- Update the TOML dependency to 1.2.1.
+- Add on-demand local parser fuzzing and document configuration and security verification.
+- Simplify app-list checks and native menu setup without changing app behaviour.
+- Remove redundant manual thread-safety implementations.
+
+### Removed
+
+- Remove the Scorecard badge and workflow.
+
 ## 0.5.0 - 2026-11-14
 
 Changes since v0.4.1.

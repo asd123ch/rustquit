@@ -26,6 +26,10 @@ cargo audit
 The continuous integration workflow runs the same checks on macOS. It also
 checks the release shell scripts for syntax errors.
 
+Parser fuzzing uses the same source modules as the app, without macOS services.
+See [fuzz/README.md](fuzz/README.md) for deterministic seed checks and bounded
+local AddressSanitizer runs. Use synthetic inputs only.
+
 ## Pull requests
 
 1. Create a focused branch and keep unrelated changes out of the pull request.

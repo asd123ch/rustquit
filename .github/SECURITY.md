@@ -41,6 +41,8 @@ Optional update checks use GitHub's HTTPS release API with bounded responses,
 timeouts and no redirects. RustQuit validates release versions and pins links
 to this repository's release pages. It never downloads or executes updates
 automatically. Auto-Quit and Keep work without network access.
+The [cryptographic dependencies](../docs/CRYPTOGRAPHY.md) document the platform
+TLS requirements and release-signing tools.
 
 The app is not App-Sandboxed because it must inspect Accessibility elements
 owned by other applications. Official releases use Apple notarization and the
@@ -69,3 +71,5 @@ Replace `VERSION` and the paths with the downloaded release. The signer file
 contains only the public release key. Do not substitute an untrusted key when
 verification fails. This signature authenticates the download; it does not
 prove that the binary was reproducibly built from the source.
+
+Apple signing and notarization credentials remain on the maintainer's Mac.

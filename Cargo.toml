@@ -1,6 +1,6 @@
 [package]
 name = "rustquit"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.88"
 description = "Privacy-focused macOS menu bar utility that quits apps after their last window closes"
@@ -104,7 +104,7 @@ objc2-service-management = { version = "0.3.2", default-features = false, featur
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 semver = "1.0.28"
-toml = "1.2.0"
+toml = "1.2.1"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = [

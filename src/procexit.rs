@@ -30,11 +30,6 @@ pub struct ProcExitWatcher {
 
 pub type ProcExitHandle = Arc<ProcExitWatcher>;
 
-// The kqueue descriptor is used from the main thread (registration) and
-// the watcher thread (waiting); kevent is thread-safe per queue.
-unsafe impl Send for ProcExitWatcher {}
-unsafe impl Sync for ProcExitWatcher {}
-
 impl ProcExitWatcher {
     pub fn spawn() -> io::Result<ProcExitHandle> {
         let kq = unsafe { libc::kqueue() };

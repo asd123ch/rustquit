@@ -37,7 +37,7 @@ use objc2_foundation::{
     NSString, NSTimer, ns_string,
 };
 
-use crate::config::ConfigHandle;
+use crate::config::{ConfigHandle, is_app_listed};
 use crate::engine::recent::{RecentQuitsHandle, RecentReason};
 use crate::procexit::{ExitKind, ProcExitHandle};
 
@@ -61,6 +61,7 @@ pub struct KeepAlive {
     /// Timestamps of automatic restarts, per lowercase bundle ID.
     restarts: RefCell<HashMap<String, Vec<Instant>>>,
     paused_until: RefCell<HashMap<String, Instant>>,
+    background_helpers: RefCell<HashMap<String, libc::pid_t>>,
 }
 
 /// Keeps the KVO registration alive; must live until exit.
@@ -143,7 +144,7 @@ impl RunningAppsObserver {
     /// every disappeared app and watches every appeared keep-listed one.
     fn diff_running_apps(&self) {
         let current = snapshot_running_apps();
-        let (terminated, appeared) = {
+        let (terminated, appeared, exited) = {
             let known = self.ivars().known.borrow();
             let terminated = terminated_apps(&known, &current);
             let appeared: Vec<(libc::pid_t, String)> = current
@@ -151,7 +152,12 @@ impl RunningAppsObserver {
                 .filter(|(pid, _)| !known.contains_key(pid))
                 .map(|(pid, app)| (*pid, app.bundle_id.clone()))
                 .collect();
-            (terminated, appeared)
+            let exited = known
+                .keys()
+                .filter(|pid| !current.contains_key(pid))
+                .copied()
+                .collect();
+            (terminated, appeared, exited)
         };
         self.ivars().known.replace(current);
         if let Some(keep_alive) = self.ivars().keep_alive.upgrade() {
@@ -160,6 +166,11 @@ impl RunningAppsObserver {
             }
             for (pid, app) in terminated {
                 keep_alive.on_terminated(app.bundle_id, app.name, pid, app.menu_bar);
+            }
+            let affected =
+                take_exited_helpers(&mut keep_alive.background_helpers.borrow_mut(), &exited);
+            for bundle_id in affected {
+                keep_alive.schedule_restart(bundle_id, None, true);
             }
         }
     }
@@ -223,6 +234,7 @@ pub fn setup(config: ConfigHandle, recent_quits: RecentQuitsHandle) -> KeepAlive
         proc_exit,
         restarts: RefCell::new(HashMap::new()),
         paused_until: RefCell::new(HashMap::new()),
+        background_helpers: RefCell::new(HashMap::new()),
     });
 
     // Persistent ignores survive a RustQuit restart. Recreate their expiry
@@ -279,10 +291,19 @@ pub fn setup(config: ConfigHandle, recent_quits: RecentQuitsHandle) -> KeepAlive
 }
 
 impl KeepAlive {
+    pub fn set_enabled(&self, enabled: bool) -> std::io::Result<()> {
+        self.config
+            .update(|config| config.keep_alive_enabled = enabled)?;
+        if enabled {
+            self.reconcile_missing_apps();
+        }
+        Ok(())
+    }
+
     /// Registers a keep-listed running app with the exit watcher, so its
     /// eventual exit status (crash vs. deliberate quit) is captured.
     fn watch_if_listed(&self, pid: libc::pid_t, bundle_id: &str) {
-        let listed = is_listed(&self.config.data.borrow().keep_alive_apps, bundle_id);
+        let listed = is_app_listed(&self.config.data.borrow().keep_alive_apps, bundle_id);
         if listed && let Some(proc_exit) = &self.proc_exit {
             proc_exit.watch(pid);
         }
@@ -295,22 +316,31 @@ impl KeepAlive {
         pid: libc::pid_t,
         menu_bar: bool,
     ) {
-        let (enabled, listed, delay) = {
+        let listed = {
             let config = self.config.data.borrow();
-            (
-                config.keep_alive_enabled,
-                is_listed(&config.keep_alive_apps, &bundle_id),
-                config.keep_alive_delay_secs,
-            )
+            is_app_listed(&config.keep_alive_apps, &bundle_id)
         };
         if !listed {
             return;
         }
         self.recent_quits
             .push_keep_termination(bundle_id.clone(), name);
-        if !enabled {
-            return;
-        }
+        self.schedule_restart(bundle_id, Some(pid), menu_bar);
+    }
+
+    fn schedule_restart(
+        self: &Rc<Self>,
+        bundle_id: String,
+        pid: Option<libc::pid_t>,
+        menu_bar: bool,
+    ) {
+        let delay = {
+            let config = self.config.data.borrow();
+            if !config.keep_alive_enabled || !is_app_listed(&config.keep_alive_apps, &bundle_id) {
+                return;
+            }
+            config.keep_alive_delay_secs
+        };
         tracing::info!(
             bundle_id,
             delay,
@@ -331,7 +361,7 @@ impl KeepAlive {
     /// Runs after the delay; everything is re-checked at fire time. This
     /// is the only path that counts toward loop protection — startup
     /// reconciliation and the user checking a Keep box do not.
-    fn restart(&self, bundle_id: &str, pid: libc::pid_t, menu_bar: bool) {
+    fn restart(self: &Rc<Self>, bundle_id: &str, pid: Option<libc::pid_t>, menu_bar: bool) {
         // Never resurrect an app RustQuit itself just quit.
         let self_quit = self.recent_quits.snapshot().iter().any(|quit| {
             quit.reason == RecentReason::AutoQuit
@@ -345,7 +375,7 @@ impl KeepAlive {
         let exit_kind = self
             .proc_exit
             .as_ref()
-            .and_then(|proc_exit| proc_exit.take_exit_kind(pid));
+            .and_then(|proc_exit| pid.and_then(|pid| proc_exit.take_exit_kind(pid)));
         let auto_start_missing = self.config.data.borrow().keep_alive_auto_start_missing;
         // Without the always-running option, regular apps are only restored
         // after crashes. Menu bar apps retain their original Keep behavior.
@@ -383,9 +413,9 @@ impl KeepAlive {
                 list.len()
             };
             if recent >= LOOP_LIMIT {
-                self.paused_until
-                    .borrow_mut()
-                    .insert(key, Instant::now() + PAUSE);
+                let until = Instant::now() + PAUSE;
+                self.paused_until.borrow_mut().insert(key, until);
+                self.schedule_loop_expiry(bundle_id.to_string(), until);
                 tracing::warn!(
                     bundle_id,
                     "keep-alive paused for a day after repeated restarts \
@@ -437,9 +467,12 @@ impl KeepAlive {
     /// Running menu bar helpers suppress a frontend launch altogether.
     /// Hiding a launch alone cannot prevent an app from showing its UI.
     fn launch_if_needed(&self, bundle_id: &str) -> bool {
+        self.background_helpers
+            .borrow_mut()
+            .retain(|id, _| !id.eq_ignore_ascii_case(bundle_id));
         {
             let config = self.config.data.borrow();
-            if !config.keep_alive_enabled || !is_listed(&config.keep_alive_apps, bundle_id) {
+            if !config.keep_alive_enabled || !is_app_listed(&config.keep_alive_apps, bundle_id) {
                 return false;
             }
         }
@@ -463,7 +496,10 @@ impl KeepAlive {
             return false;
         };
         let target_path = url.path().map(|path| path.to_string()).unwrap_or_default();
-        if background_suite_running(bundle_id, &target_path) {
+        if let Some(pid) = background_suite_helper(bundle_id, &target_path) {
+            self.background_helpers
+                .borrow_mut()
+                .insert(bundle_id.to_string(), pid);
             tracing::debug!(
                 bundle_id,
                 "keep-alive: related background process is already running"
@@ -511,6 +547,38 @@ impl KeepAlive {
             }
             None => false,
         }
+    }
+
+    fn schedule_loop_expiry(self: &Rc<Self>, bundle_id: String, until: Instant) {
+        let delay = until
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64()
+            .max(0.05);
+        let weak = Rc::downgrade(self);
+        let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            crate::engine::catch_callback_panic("keep-alive loop pause timer", || {
+                if let Some(keep_alive) = weak.upgrade() {
+                    keep_alive.on_loop_pause_expired(&bundle_id, until);
+                }
+            });
+        });
+        let _ =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(delay, false, &block) };
+    }
+
+    fn on_loop_pause_expired(self: &Rc<Self>, bundle_id: &str, expected_until: Instant) {
+        let key = bundle_id.to_ascii_lowercase();
+        let stored = self.paused_until.borrow().get(&key).copied();
+        match pause_expiry(stored, expected_until, Instant::now()) {
+            PauseExpiry::Stale => return,
+            PauseExpiry::Waiting => {
+                self.schedule_loop_expiry(bundle_id.to_string(), expected_until);
+                return;
+            }
+            PauseExpiry::Ready => {}
+        }
+        self.paused_until.borrow_mut().remove(&key);
+        self.launch_if_needed(bundle_id);
     }
 
     /// Suppresses every automatic Keep launch for 24 hours. Persisting the
@@ -593,7 +661,9 @@ impl KeepAlive {
             tracing::warn!(%err, bundle_id, "cannot remove expired keep-alive ignore");
         }
         self.watch_running_instances(bundle_id);
-        self.launch_if_needed(bundle_id);
+        if !self.is_paused(bundle_id) {
+            self.launch_if_needed(bundle_id);
+        }
         tracing::info!(bundle_id, "keep-alive 24-hour ignore expired");
     }
 
@@ -609,14 +679,43 @@ impl KeepAlive {
     }
 }
 
-fn is_listed(list: &[String], bundle_id: &str) -> bool {
-    list.iter().any(|b| b.eq_ignore_ascii_case(bundle_id))
+#[derive(Debug, PartialEq, Eq)]
+enum PauseExpiry {
+    Stale,
+    Waiting,
+    Ready,
+}
+
+fn pause_expiry(stored: Option<Instant>, expected: Instant, now: Instant) -> PauseExpiry {
+    if stored != Some(expected) {
+        PauseExpiry::Stale
+    } else if now < expected {
+        PauseExpiry::Waiting
+    } else {
+        PauseExpiry::Ready
+    }
+}
+
+fn take_exited_helpers(
+    helpers: &mut HashMap<String, libc::pid_t>,
+    exited: &HashSet<libc::pid_t>,
+) -> Vec<String> {
+    let mut affected = Vec::new();
+    helpers.retain(|bundle_id, pid| {
+        if exited.contains(pid) {
+            affected.push(bundle_id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    affected
 }
 
 /// Settings frontends often exit while a separately installed menu bar
 /// helper keeps the product alive. Treat a related accessory app as the
 /// selected app already running, without maintaining product-specific IDs.
-fn background_suite_running(target_bundle_id: &str, target_path: &str) -> bool {
+fn background_suite_helper(target_bundle_id: &str, target_path: &str) -> Option<libc::pid_t> {
     let bundle_prefix = format!("{}.", target_bundle_id.to_ascii_lowercase());
     let target_name = Path::new(target_path)
         .file_stem()
@@ -628,13 +727,10 @@ fn background_suite_running(target_bundle_id: &str, target_path: &str) -> bool {
         .runningApplications()
         .iter()
         .filter(|app| !app.isTerminated())
-        .any(|app| {
-            let Some(helper_path) = app
+        .find_map(|app| {
+            let helper_path = app
                 .bundleURL()
-                .and_then(|url| url.path().map(|path| path.to_string()))
-            else {
-                return false;
-            };
+                .and_then(|url| url.path().map(|path| path.to_string()))?;
             related_background_app(
                 &bundle_prefix,
                 target_name.as_deref(),
@@ -646,6 +742,7 @@ fn background_suite_running(target_bundle_id: &str, target_path: &str) -> bool {
                 Path::new(&helper_path),
                 app.activationPolicy(),
             )
+            .then(|| app.processIdentifier())
         })
 }
 
@@ -688,10 +785,54 @@ fn normalized_app_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{KnownApp, related_background_app, terminated_apps};
+    use super::{
+        KnownApp, PauseExpiry, pause_expiry, related_background_app, take_exited_helpers,
+        terminated_apps,
+    };
     use objc2_app_kit::NSApplicationActivationPolicy as Policy;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn loop_pause_expires_at_its_deadline_and_after_delayed_delivery() {
+        let until = Instant::now() + Duration::from_secs(86400);
+        assert_eq!(
+            pause_expiry(Some(until), until, until - Duration::from_secs(1)),
+            PauseExpiry::Waiting
+        );
+        assert_eq!(pause_expiry(Some(until), until, until), PauseExpiry::Ready);
+        assert_eq!(
+            pause_expiry(Some(until), until, until + Duration::from_secs(3600)),
+            PauseExpiry::Ready
+        );
+    }
+
+    #[test]
+    fn old_loop_timers_cannot_resume_cancelled_or_replaced_pauses() {
+        let old = Instant::now();
+        let replacement = old + Duration::from_secs(86400);
+        assert_eq!(pause_expiry(None, old, replacement), PauseExpiry::Stale);
+        assert_eq!(
+            pause_expiry(Some(replacement), old, replacement),
+            PauseExpiry::Stale
+        );
+    }
+
+    #[test]
+    fn helper_exits_recheck_only_the_apps_they_kept_running() {
+        let mut helpers = HashMap::from([
+            ("com.example.first".into(), 100),
+            ("com.example.second".into(), 200),
+            ("com.example.shared".into(), 100),
+        ]);
+        assert!(take_exited_helpers(&mut helpers, &HashSet::from([999])).is_empty());
+        let mut affected = take_exited_helpers(&mut helpers, &HashSet::from([100]));
+        affected.sort();
+        assert_eq!(affected, ["com.example.first", "com.example.shared"]);
+        assert_eq!(helpers, HashMap::from([("com.example.second".into(), 200)]));
+        assert!(take_exited_helpers(&mut helpers, &HashSet::from([100])).is_empty());
+    }
 
     #[test]
     fn embedded_menu_bar_app_keeps_settings_frontend_closed() {

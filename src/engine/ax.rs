@@ -37,11 +37,13 @@ fn check(err: AXError) -> AxResult<()> {
 }
 
 pub fn application_element(pid: libc::pid_t) -> CFRetained<AXUIElement> {
-    let element = unsafe { AXUIElement::new_application(pid) };
-    // Keep individual calls bounded. Recounts run on a worker, while observer
-    // setup still happens on the main thread.
-    let _ = unsafe { element.set_messaging_timeout(0.25) };
-    element
+    unsafe { AXUIElement::new_application(pid) }
+}
+
+pub fn configure_messaging_timeout() -> AxResult<()> {
+    // Only the system-wide object sets the timeout for newly returned windows too.
+    let system = unsafe { AXUIElement::new_system_wide() };
+    check(unsafe { system.set_messaging_timeout(0.25) })
 }
 
 /// Copies an attribute value; the caller owns the result.
@@ -59,14 +61,21 @@ pub fn copy_attribute(element: &AXUIElement, name: &str) -> AxResult<CFRetained<
 /// All window elements of the app (unfiltered).
 pub fn windows(app_element: &AXUIElement) -> AxResult<Vec<CFRetained<AXUIElement>>> {
     let value = copy_attribute(app_element, ATTR_WINDOWS)?;
-    let array = value.downcast::<CFArray>().map_err(|_| AXError::Failure)?;
+    window_elements(&value)
+}
+
+fn window_elements(value: &CFType) -> AxResult<Vec<CFRetained<AXUIElement>>> {
+    let array = value.downcast_ref::<CFArray>().ok_or(AXError::Failure)?;
     let mut result = Vec::new();
-    // The AX API guarantees the element type is AXUIElement.
     for i in 0..array.count() {
         let ptr = unsafe { array.value_at_index(i) };
-        if let Some(ptr) = NonNull::new(ptr.cast_mut()) {
-            result.push(unsafe { CFRetained::retain(ptr.cast::<AXUIElement>()) });
-        }
+        let ptr = NonNull::new(ptr.cast_mut()).ok_or(AXError::Failure)?;
+        let value = unsafe { CFRetained::retain(ptr.cast::<CFType>()) };
+        result.push(
+            value
+                .downcast::<AXUIElement>()
+                .map_err(|_| AXError::Failure)?,
+        );
     }
     Ok(result)
 }
@@ -155,5 +164,48 @@ impl Observer {
 impl Drop for Observer {
     fn drop(&mut self) {
         self.source.invalidate();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_wide_messaging_timeout_is_accepted() {
+        assert_eq!(configure_messaging_timeout(), Ok(()));
+    }
+
+    #[test]
+    fn ax_errors_are_preserved() {
+        assert_eq!(check(AXError::Success), Ok(()));
+        for error in [
+            AXError::CannotComplete,
+            AXError::APIDisabled,
+            AXError::AttributeUnsupported,
+            AXError::InvalidUIElement,
+        ] {
+            assert_eq!(check(error), Err(error));
+        }
+    }
+
+    #[test]
+    fn window_values_require_an_array_of_ax_elements() {
+        let text = CFString::from_str("not a window");
+        assert!(window_elements(text.as_ref()).is_err());
+        let array = CFArray::from_retained_objects(&[text]);
+        assert!(window_elements(array.as_ref()).is_err());
+        let empty = CFArray::<AXUIElement>::from_retained_objects(&[]);
+        assert!(window_elements(empty.as_ref()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decoded_ax_elements_outlive_their_source_array() {
+        let element = application_element(std::process::id() as libc::pid_t);
+        let array = CFArray::from_retained_objects(std::slice::from_ref(&element));
+        let decoded = window_elements(array.as_ref()).unwrap();
+        drop(array);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(*decoded[0], *element);
     }
 }

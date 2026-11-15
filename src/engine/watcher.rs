@@ -119,18 +119,17 @@ impl Watcher {
     }
 
     /// Registers the destroy notification for a (new) window.
-    pub fn watch_window(&self, window: CFRetained<AXUIElement>) {
-        if self.watched_windows.borrow().iter().any(|w| **w == *window) {
-            return;
-        }
+    pub fn watch_window(&self, window: CFRetained<AXUIElement>) -> AxResult<()> {
         // Remember the standard window even if this app does not support a
         // per-window destroy notification. The AppKit deactivation fallback
         // can still recount it safely later.
-        if matches!(
-            ax::subrole(&window).as_deref(),
-            Ok(ax::SUBROLE_STANDARD_WINDOW)
-        ) {
+        let subrole = ax::subrole(&window);
+        if matches!(subrole.as_deref(), Ok(ax::SUBROLE_STANDARD_WINDOW)) {
             self.had_window.set(true);
+        }
+        // A registered window can still need a retry of its failed type query.
+        if self.watched_windows.borrow().iter().any(|w| **w == *window) {
+            return subrole.map(|_| ());
         }
         match self
             .observer
@@ -147,15 +146,19 @@ impl Watcher {
                 );
             }
         }
+        subrole.map(|_| ())
     }
 
     /// Synchronizes windows that were already present before the observer
     /// became ready. Transient AX startup failures are retried by Engine.
     pub fn refresh_windows(&self) -> AxResult<()> {
+        let mut result = Ok(());
         for window in ax::windows(&self.element)? {
-            self.watch_window(window);
+            if let Err(error) = self.watch_window(window) {
+                result = Err(error);
+            }
         }
-        Ok(())
+        result
     }
 
     /// Drops a destroyed window from the list.
@@ -180,6 +183,33 @@ impl Drop for Watcher {
         ] {
             self.observer
                 .remove_notification(&self.element, notification);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_callbacks_without_a_live_engine_do_nothing() {
+        let element = ax::application_element(std::process::id() as libc::pid_t);
+        let notification = CFString::from_str(ax::NOTIF_ELEMENT_DESTROYED);
+        let context = CallbackContext {
+            pid: std::process::id() as libc::pid_t,
+            engine: Weak::new(),
+        };
+        for refcon in [std::ptr::null_mut(), &context as *const _ as *mut c_void] {
+            // The callback never reads its observer argument. Real retained CF
+            // objects cover the other pointers without registering an observer.
+            unsafe {
+                ax_callback(
+                    NonNull::dangling(),
+                    NonNull::from(element.as_ref()),
+                    NonNull::from(notification.as_ref()),
+                    refcon,
+                );
+            }
         }
     }
 }

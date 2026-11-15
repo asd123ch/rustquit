@@ -10,12 +10,11 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.5.0" src="https://img.shields.io/badge/version-0.5.0-2f81f7">
+  <img alt="Version 0.5.1" src="https://img.shields.io/badge/version-0.5.1-2f81f7">
   <a href="LICENSE"><img alt="GNU AGPL v3.0" src="https://img.shields.io/badge/license-AGPLv3-3da639"></a>
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <a href="#privacy-and-security"><img alt="Privacy: no telemetry" src="https://img.shields.io/badge/privacy-no_telemetry-6f42c1"></a>
   <a href="https://github.com/asd123ch/rustquit/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/asd123ch/rustquit/actions/workflows/ci.yml/badge.svg"></a>
-  <a href="https://scorecard.dev/viewer/?uri=github.com/asd123ch/rustquit"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/asd123ch/rustquit/badge"></a>
 </p>
 
 <p align="center">
@@ -174,6 +173,8 @@ when Accessibility access or Launch at Login approval is missing.
 
 Settings are stored in `~/Library/Application Support/rustquit/config.toml`
 with user-only permissions. Manual edits take effect after restarting RustQuit.
+See the [configuration reference](docs/CONFIGURATION.md) for fields, defaults
+and validation rules.
 
 Persistent logs are off by default. Quit RustQuit before starting a diagnostic
 session from Terminal:

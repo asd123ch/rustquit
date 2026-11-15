@@ -14,7 +14,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString, ns_string};
 
-use crate::config::ConfigHandle;
+use crate::config::{ConfigHandle, is_app_listed};
 use crate::engine::recent::{RecentQuitsHandle, age_label};
 use crate::keepalive::KeepAlive;
 use crate::settings_window::SettingsController;
@@ -75,10 +75,7 @@ define_class!(
         fn on_toggle_keep_alive(&self, _sender: Option<&AnyObject>) {
             let ivars = self.ivars();
             let wanted = !ivars.config.data.borrow().keep_alive_enabled;
-            if let Err(err) = ivars
-                .config
-                .update(|config| config.keep_alive_enabled = wanted)
-            {
+            if let Err(err) = ivars.keep_alive.set_enabled(wanted) {
                 tracing::error!(%err, "cannot persist keep-alive state");
             }
             self.sync_from_config();
@@ -289,13 +286,10 @@ impl TrayTarget {
         let target_obj: &AnyObject = self;
         for entry in entries {
             let title = format!("{} — {}", entry.name, age_label(entry.when));
-            let kept = ivars
-                .config
-                .data
-                .borrow()
-                .keep_alive_apps
-                .iter()
-                .any(|id| id.eq_ignore_ascii_case(&entry.bundle_id));
+            let kept = is_app_listed(
+                &ivars.config.data.borrow().keep_alive_apps,
+                &entry.bundle_id,
+            );
             if kept {
                 let (label, action) = match ivars.keep_alive.ignore_remaining(&entry.bundle_id) {
                     Some(remaining) => (
@@ -415,27 +409,17 @@ impl Tray {
             .permission_separator
             .replace(Some(permission_separator));
 
-        let enabled_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Auto-Quit"),
-                Some(sel!(onToggleEnabled:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { enabled_item.setTarget(Some(target_obj)) };
+        let enabled_item = action_item("Auto-Quit", sel!(onToggleEnabled:), None, target_obj, mtm);
         menu.addItem(&enabled_item);
         target.ivars().enabled_item.replace(Some(enabled_item));
 
-        let keep_alive_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Keep Running"),
-                Some(sel!(onToggleKeepAlive:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { keep_alive_item.setTarget(Some(target_obj)) };
+        let keep_alive_item = action_item(
+            "Keep Running",
+            sel!(onToggleKeepAlive:),
+            None,
+            target_obj,
+            mtm,
+        );
         menu.addItem(&keep_alive_item);
         target
             .ivars()
@@ -459,41 +443,19 @@ impl Tray {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        let update_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!(""),
-                Some(sel!(onOpenUpdate:)),
-                ns_string!(""),
-            )
-        };
-        unsafe { update_item.setTarget(Some(target_obj)) };
+        let update_item = action_item("", sel!(onOpenUpdate:), None, target_obj, mtm);
         update_item.setHidden(true);
         menu.addItem(&update_item);
         target.ivars().update_item.replace(Some(update_item));
 
-        let settings_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Settings…"),
-                Some(sel!(onOpenSettings:)),
-                ns_string!(","),
-            )
-        };
-        unsafe { settings_item.setTarget(Some(target_obj)) };
+        let settings_item = action_item("Settings…", sel!(onOpenSettings:), None, target_obj, mtm);
+        settings_item.setKeyEquivalent(ns_string!(","));
         menu.addItem(&settings_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        let quit_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                ns_string!("Quit RustQuit"),
-                Some(sel!(onQuit:)),
-                ns_string!("q"),
-            )
-        };
-        unsafe { quit_item.setTarget(Some(target_obj)) };
+        let quit_item = action_item("Quit RustQuit", sel!(onQuit:), None, target_obj, mtm);
+        quit_item.setKeyEquivalent(ns_string!("q"));
         menu.addItem(&quit_item);
 
         // The delegate refreshes the toggle states on every open, so

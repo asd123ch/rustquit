@@ -19,7 +19,7 @@ use objc2_foundation::{
     NSSize, NSString, ns_string,
 };
 
-use crate::config::{ConfigHandle, FilterMode};
+use crate::config::{ConfigHandle, FilterMode, is_app_listed};
 use crate::engine;
 use crate::update_monitor::UpdateMonitor;
 
@@ -206,11 +206,8 @@ define_class!(
         fn on_keep_alive_enabled_changed(&self, sender: Option<&NSButton>) {
             let Some(sender) = sender else { return };
             let wanted = sender.state() == NSControlStateValueOn;
-            if let Err(err) = self
-                .ivars()
-                .config
-                .update(|config| config.keep_alive_enabled = wanted)
-            {
+            let Some(keep_alive) = self.ivars().keep_alive.borrow().clone() else { return };
+            if let Err(err) = keep_alive.set_enabled(wanted) {
                 tracing::error!(%err, "cannot persist keep-alive state");
                 self.sync_controls();
             }
@@ -435,10 +432,6 @@ impl SettingsController {
             .unwrap_or_default();
 
         let config = self.ivars().config.data.borrow();
-        let in_list = |list: &[String]| {
-            list.iter()
-                .any(|b| b.eq_ignore_ascii_case(&entry.bundle_id))
-        };
         let checkbox_cell = |listed: bool, enabled: bool, action: Sel| {
             let checkbox = unsafe {
                 NSButton::checkboxWithTitle_target_action(
@@ -462,8 +455,8 @@ impl SettingsController {
         // Quit and Keep are mutually exclusive per app: whichever side is
         // checked greys the other out (the engine would ignore the quit
         // entry anyway — keep-alive apps are never auto-quit).
-        let quit_listed = in_list(&config.apps);
-        let keep_listed = in_list(&config.keep_alive_apps);
+        let quit_listed = is_app_listed(&config.apps, &entry.bundle_id);
+        let keep_listed = is_app_listed(&config.keep_alive_apps, &entry.bundle_id);
         match identifier.as_str() {
             "quit" => Some(checkbox_cell(quit_listed, !keep_listed, sel!(onToggleApp:))),
             "keep" => Some(checkbox_cell(
@@ -685,11 +678,10 @@ impl SettingsController {
         let filtered: Vec<AppEntry> = all
             .iter()
             .filter(|entry| {
-                let selected = |list: &[String]| {
-                    list.iter()
-                        .any(|b| b.eq_ignore_ascii_case(&entry.bundle_id))
-                };
-                if only_selected && !selected(&config.apps) && !selected(&config.keep_alive_apps) {
+                if only_selected
+                    && !is_app_listed(&config.apps, &entry.bundle_id)
+                    && !is_app_listed(&config.keep_alive_apps, &entry.bundle_id)
+                {
                     return false;
                 }
                 query.is_empty()
@@ -727,20 +719,18 @@ impl SettingsController {
     fn sync_controls(&self) {
         let ivars = self.ivars();
         let config = ivars.config.data.borrow();
-        let (on, off) = (NSControlStateValueOn, NSControlStateValueOff);
-        if let Some(radio) = ivars.whitelist_radio.borrow().as_ref() {
-            radio.setState(if config.mode == FilterMode::Whitelist {
-                on
+        let state = |enabled: bool| {
+            if enabled {
+                NSControlStateValueOn
             } else {
-                off
-            });
+                NSControlStateValueOff
+            }
+        };
+        if let Some(radio) = ivars.whitelist_radio.borrow().as_ref() {
+            radio.setState(state(config.mode == FilterMode::Whitelist));
         }
         if let Some(radio) = ivars.blacklist_radio.borrow().as_ref() {
-            radio.setState(if config.mode == FilterMode::Blacklist {
-                on
-            } else {
-                off
-            });
+            radio.setState(state(config.mode == FilterMode::Blacklist));
         }
         if let Some(popup) = ivars.delay_popup.borrow().as_ref() {
             let index = DELAY_CHOICES
@@ -750,34 +740,22 @@ impl SettingsController {
             popup.selectItemAtIndex(index as NSInteger);
         }
         if let Some(checkbox) = ivars.autostart_checkbox.borrow().as_ref() {
-            checkbox.setState(if crate::autostart::is_enabled() {
-                on
-            } else {
-                off
-            });
+            checkbox.setState(state(crate::autostart::is_enabled()));
         }
         if let Some(checkbox) = ivars.enabled_checkbox.borrow().as_ref() {
-            checkbox.setState(if config.enabled { on } else { off });
+            checkbox.setState(state(config.enabled));
         }
         if let Some(checkbox) = ivars.updates_checkbox.borrow().as_ref() {
-            checkbox.setState(if config.check_for_updates { on } else { off });
+            checkbox.setState(state(config.check_for_updates));
         }
         if let Some(checkbox) = ivars.keep_alive_checkbox.borrow().as_ref() {
-            checkbox.setState(if config.keep_alive_enabled { on } else { off });
+            checkbox.setState(state(config.keep_alive_enabled));
         }
         if let Some(checkbox) = ivars.auto_start_missing_checkbox.borrow().as_ref() {
-            checkbox.setState(if config.keep_alive_auto_start_missing {
-                on
-            } else {
-                off
-            });
+            checkbox.setState(state(config.keep_alive_auto_start_missing));
         }
         if let Some(checkbox) = ivars.loop_protection_checkbox.borrow().as_ref() {
-            checkbox.setState(if config.keep_alive_loop_protection {
-                on
-            } else {
-                off
-            });
+            checkbox.setState(state(config.keep_alive_loop_protection));
         }
         if let Some(popup) = ivars.restart_delay_popup.borrow().as_ref() {
             let index = RESTART_DELAY_CHOICES
