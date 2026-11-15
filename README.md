@@ -31,6 +31,10 @@ running. RustQuit asks the app to quit after its last window closes, just
 like pressing ⌘Q. Save dialogs remain available; apps are never force-quit.
 
 <p align="center">
+  <img src="assets/preview.png" alt="RustQuit: Close the window. Quit the app." width="800">
+</p>
+
+<p align="center">
   <img src="assets/screenshot.png" alt="RustQuit settings window" width="480">
 </p>
 
